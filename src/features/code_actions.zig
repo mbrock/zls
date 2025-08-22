@@ -95,8 +95,16 @@ pub const Builder = struct {
 
         const tree = builder.handle.tree;
 
-        const source_index = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
+        // 1) Barebones refactor: extract selected range into a new function
+        // Offer this when the selection is non-empty.
+        const start_index = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
+        const end_index = offsets.positionToIndex(tree.source, range.end, builder.offset_encoding);
+        if (end_index > start_index) {
+            try generateExtractFunctionCodeAction(builder, .{ .start = start_index, .end = end_index });
+        }
 
+        // 2) Existing string literal refactors (only when cursor is in a string)
+        const source_index = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
         const ctx = try Analyser.getPositionContext(builder.arena, builder.handle.tree, source_index, true);
         if (ctx != .string_literal) return;
 
@@ -113,6 +121,249 @@ pub const Builder = struct {
             .string_literal => try generateStringLiteralCodeActions(builder, token_idx),
             else => {},
         }
+    }
+
+    fn generateExtractFunctionCodeAction(builder: *Builder, loc: offsets.Loc) !void {
+        const tracy_zone = tracy.trace(@src());
+        defer tracy_zone.end();
+
+        if (!builder.wantKind(.refactor)) return;
+
+        const tree = builder.handle.tree;
+        const source = tree.source;
+
+        // Selected code
+        if (loc.end <= loc.start) return;
+
+        // Trim whitespace and detect trailing semicolon
+        var start_index = loc.start;
+        var end_index = loc.end;
+        while (start_index < end_index and std.ascii.isWhitespace(source[start_index])) start_index += 1;
+        while (end_index > start_index and std.ascii.isWhitespace(source[end_index - 1])) end_index -= 1;
+        if (end_index <= start_index) return;
+
+        var has_trailing_semicolon = false;
+        if (source[end_index - 1] == ';') {
+            has_trailing_semicolon = true;
+            end_index -= 1;
+            while (end_index > start_index and std.ascii.isWhitespace(source[end_index - 1])) end_index -= 1;
+        }
+
+        // Identify token span covering selection
+        const left_token = offsets.sourceIndexToTokenIndex(tree, start_index).preferRight(&tree);
+        const right_token = offsets.sourceIndexToTokenIndex(tree, end_index).preferLeft();
+        if (right_token < left_token) return; // shouldn't happen, but guard
+
+        // v1 validation: reject obvious control-flow/defers inside selection.
+        // Also restrict to a single expression (at most one semicolon which we already trimmed).
+        var semicolon_count: usize = 0;
+        var i: Ast.TokenIndex = left_token;
+        while (i <= right_token) : (i += 1) {
+            switch (tree.tokenTag(i)) {
+                .semicolon => semicolon_count += 1,
+                .keyword_return,
+                .keyword_break,
+                .keyword_continue,
+                .keyword_defer,
+                .keyword_errdefer,
+                => return, // not supported in v1
+                else => {},
+            }
+        }
+        if (semicolon_count > 0) return; // only pure expression extraction in v1
+
+        const expr_text = source[start_index..end_index];
+        if (expr_text.len == 0) return;
+
+        // Collect external identifiers to use as parameters
+        var seen_params = std.StringHashMapUnmanaged(void){};
+        defer seen_params.deinit(builder.arena);
+
+        // Use a stable order of appearance
+        var param_names: std.ArrayList([]const u8) = .empty;
+        var param_decls: std.ArrayList(Analyser.DeclWithHandle) = .empty;
+
+        i = left_token;
+        while (i <= right_token) : (i += 1) {
+            const tag = tree.tokenTag(i);
+            if (tag != .identifier) continue;
+            const name = offsets.identifierTokenToNameSlice(tree, i);
+            if (std.mem.eql(u8, name, "_")) continue;
+
+            // Resolve declaration in current context
+            const decl = (try builder.analyser.lookupSymbolGlobal(builder.handle, name, tree.tokenStart(i))) orelse continue;
+
+            // Ignore if declared inside the selection
+            const decl_token = decl.nameToken();
+            const decl_loc = offsets.tokenToLoc(tree, decl_token);
+            if (decl_loc.start >= start_index and decl_loc.end <= end_index) continue;
+
+            // If declaration is static/global or container field, it is accessible without params
+            const is_static = blk: {
+                // best-effort: errors mean unknown -> treat as non-static to be safe
+                break :blk decl.isStatic() catch false;
+            };
+            if (is_static) continue;
+
+            // Deduplicate and record param
+            const gop = try seen_params.getOrPut(builder.arena, name);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try builder.arena.dupe(u8, name);
+                try param_names.append(builder.arena, name);
+                try param_decls.append(builder.arena, decl);
+            }
+        }
+
+        // Determine target container and function name avoiding conflicts
+        const container_ty = try builder.analyser.innermostContainer(builder.handle, start_index);
+
+        const base_name: []const u8 = "extracted";
+        var chosen_name = base_name;
+        var suffix: usize = 1;
+        while (try Analyser.lookupSymbolContainer(container_ty, chosen_name, .other)) |_| {
+            // name conflict; try next
+            const buf = try std.fmt.allocPrint(builder.arena, "{s}{d}", .{ base_name, suffix });
+            suffix += 1;
+            chosen_name = buf;
+        }
+
+        // Attempt to infer return type from the selected expression.
+        var inferred_return_type: ?[]const u8 = null;
+        {
+            const mid_index = start_index + (end_index - start_index) / 2;
+            const nodes = try ast.nodesOverlappingIndex(builder.arena, tree, mid_index);
+            if (nodes.len != 0) {
+                var expr_node = nodes[0];
+                var expr_node_idx_in_nodes: usize = 0;
+                // pick the largest node fully contained in [left_token, right_token]
+                for (nodes, 0..) |n, ni| {
+                    const first_tok = tree.firstToken(n);
+                    const last_tok = ast.lastToken(tree, n);
+                    if (first_tok < left_token or last_tok > right_token) continue;
+                    expr_node = n;
+                    expr_node_idx_in_nodes = ni;
+                    if (first_tok == left_token and last_tok == right_token) break;
+                }
+                const ancestors = nodes[expr_node_idx_in_nodes + 1 ..];
+                // Prefer literal type from surrounding declaration when obvious.
+                if (ancestors.len > 0 and inferred_return_type == null) {
+                    switch (tree.nodeTag(ancestors[0])) {
+                        .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
+                            const var_decl = tree.fullVarDecl(ancestors[0]).?;
+                            if (expr_node.toOptional() == var_decl.ast.init_node) {
+                                if (var_decl.ast.type_node.unwrap()) |type_node| {
+                                    inferred_return_type = offsets.nodeToSlice(tree, type_node);
+                                }
+                            }
+                        },
+                        .assign => {
+                            const lhs, const rhs = tree.nodeData(ancestors[0]).node_and_node;
+                            if (expr_node == rhs and tree.nodeTag(lhs) == .identifier) {
+                                const name_tok = tree.nodeMainToken(lhs);
+                                const name = offsets.identifierTokenToNameSlice(tree, name_tok);
+                                if (try builder.analyser.lookupSymbolGlobal(builder.handle, name, tree.tokenStart(name_tok))) |decl| {
+                                    if (try decl.typeDeclarationNode()) |type_node| {
+                                        inferred_return_type = offsets.nodeToSlice(type_node.handle.tree, type_node.node);
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+                // Fallback to resolved type text
+                if (inferred_return_type == null) {
+                    if (try builder.analyser.resolveExpressionType(builder.handle, expr_node, ancestors)) |ret_ty| {
+                        inferred_return_type = try ret_ty.stringifyTypeOf(builder.analyser, .{ .truncate_container_decls = false });
+                    }
+                }
+            }
+        }
+
+        // Build function text: fn <name>(params) <ret> { return expr; }
+        var fn_text: std.ArrayList(u8) = .empty;
+        try fn_text.appendSlice(builder.arena, "fn ");
+        try fn_text.appendSlice(builder.arena, chosen_name);
+        try fn_text.appendSlice(builder.arena, "(");
+        for (param_names.items, 0..) |p, idx| {
+            if (idx != 0) try fn_text.appendSlice(builder.arena, ", ");
+            try fn_text.appendSlice(builder.arena, p);
+            // Prefer the literal type expression from the declaration; fallback to resolved type, then anytype.
+            const type_text = blk: {
+                const decl = param_decls.items[idx];
+                if (try decl.typeDeclarationNode()) |type_node| {
+                    break :blk offsets.nodeToSlice(type_node.handle.tree, type_node.node);
+                }
+                if (try decl.resolveType(builder.analyser)) |ty|
+                    break :blk ty.stringifyTypeOf(builder.analyser, .{ .truncate_container_decls = false }) catch null;
+                break :blk null;
+            };
+            if (type_text) |tt| {
+                try fn_text.appendSlice(builder.arena, ": ");
+                try fn_text.appendSlice(builder.arena, tt);
+            } else {
+                try fn_text.appendSlice(builder.arena, ": anytype");
+            }
+        }
+        try fn_text.appendSlice(builder.arena, ") ");
+        // Return type
+        if (inferred_return_type) |rt| {
+            try fn_text.appendSlice(builder.arena, rt);
+        } else {
+            try fn_text.appendSlice(builder.arena, "@TypeOf(");
+            try fn_text.appendSlice(builder.arena, expr_text);
+            try fn_text.appendSlice(builder.arena, ")");
+        }
+        try fn_text.appendSlice(builder.arena, " {\n    return ");
+        try fn_text.appendSlice(builder.arena, expr_text);
+        try fn_text.appendSlice(builder.arena, ";\n}\n\n");
+
+        // Build call replacement
+        var call_text: std.ArrayList(u8) = .empty;
+        try call_text.appendSlice(builder.arena, chosen_name);
+        try call_text.appendSlice(builder.arena, "(");
+        for (param_names.items, 0..) |p, idx| {
+            if (idx != 0) try call_text.appendSlice(builder.arena, ", ");
+            try call_text.appendSlice(builder.arena, p);
+        }
+        try call_text.appendSlice(builder.arena, ")");
+        if (has_trailing_semicolon) try call_text.append(builder.arena, ';');
+
+        // Choose insertion point: after enclosing function if available, else EOF
+        var insert_index: usize = source.len;
+        const doc_scope = try builder.handle.getDocumentScope();
+        if (Analyser.innermostScopeAtIndexWithTag(doc_scope, start_index, .initOne(.function)).unwrap()) |fn_scope| {
+            if (DocumentScope.getScopeAstNode(doc_scope, fn_scope)) |fn_node| {
+                const fn_loc = offsets.nodeToLoc(tree, fn_node);
+                insert_index = fn_loc.end;
+            }
+        }
+
+        // Ensure there is at least one blank line between neighbors.
+        // We achieve this by prepending up to two newlines depending on what's already there.
+        var leading_needed: usize = 0;
+        var have_newlines: usize = 0;
+        var scan: usize = insert_index;
+        while (scan > 0 and have_newlines < 2 and source[scan - 1] == '\n') : (scan -= 1) {
+            have_newlines += 1;
+        }
+        if (have_newlines < 2) leading_needed = 2 - have_newlines; // 2 newlines => one blank line
+
+        var padded_fn_text: std.ArrayList(u8) = .empty;
+        try padded_fn_text.ensureTotalCapacity(builder.arena, leading_needed + fn_text.items.len);
+        for (0..leading_needed) |_| padded_fn_text.appendAssumeCapacity('\n');
+        padded_fn_text.appendSliceAssumeCapacity(fn_text.items);
+
+        var edits: std.ArrayList(types.TextEdit) = .empty;
+        try edits.append(builder.arena, builder.createTextEditPos(insert_index, padded_fn_text.items));
+        try edits.append(builder.arena, builder.createTextEditLoc(.{ .start = start_index, .end = loc.end }, call_text.items));
+
+        try builder.actions.append(builder.arena, .{
+            .title = "extract to function",
+            .kind = .refactor,
+            .isPreferred = false,
+            .edit = try builder.createWorkspaceEdit(edits.items),
+        });
     }
 
     pub fn createTextEditLoc(self: *Builder, loc: offsets.Loc, new_text: []const u8) types.TextEdit {
