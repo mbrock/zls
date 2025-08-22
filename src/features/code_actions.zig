@@ -150,30 +150,152 @@ pub const Builder = struct {
         }
 
         // Identify token span covering selection
-        const left_token = offsets.sourceIndexToTokenIndex(tree, start_index).preferRight(&tree);
-        const right_token = offsets.sourceIndexToTokenIndex(tree, end_index).preferLeft();
+        var left_token = offsets.sourceIndexToTokenIndex(tree, start_index).preferRight(&tree);
+        var right_token = offsets.sourceIndexToTokenIndex(tree, end_index).preferLeft();
         if (right_token < left_token) return; // shouldn't happen, but guard
 
-        // v1 validation: reject obvious control-flow/defers inside selection.
-        // Also restrict to a single expression (at most one semicolon which we already trimmed).
+        // Scan for control flow and semicolons to decide whether this is an expression or statements.
         var semicolon_count: usize = 0;
+        var has_return = false;
+        var has_defer = false;
+        var has_break_or_continue = false;
         var i: Ast.TokenIndex = left_token;
         while (i <= right_token) : (i += 1) {
             switch (tree.tokenTag(i)) {
                 .semicolon => semicolon_count += 1,
-                .keyword_return,
-                .keyword_break,
-                .keyword_continue,
-                .keyword_defer,
-                .keyword_errdefer,
-                => return, // not supported in v1
+                .keyword_return => has_return = true,
+                .keyword_defer, .keyword_errdefer => has_defer = true,
+                .keyword_break, .keyword_continue => has_break_or_continue = true,
                 else => {},
             }
         }
-        if (semicolon_count > 0) return; // only pure expression extraction in v1
 
-        const expr_text = source[start_index..end_index];
-        if (expr_text.len == 0) return;
+        // Check if the selection exactly matches a labeled block expression node; if so, allow breaks/semicolons.
+        var selection_is_expression = !has_return and !has_defer and semicolon_count == 0 and !has_break_or_continue;
+        if (!selection_is_expression) {
+            const mid_index = start_index + (end_index - start_index) / 2;
+            const nodes_exact = try ast.nodesOverlappingIndex(builder.arena, tree, mid_index);
+            if (nodes_exact.len != 0) {
+                for (nodes_exact) |n| {
+                    const first_tok = tree.firstToken(n);
+                    const last_tok = ast.lastToken(tree, n);
+                    if (first_tok == left_token and last_tok == right_token) {
+                        switch (tree.nodeTag(n)) {
+                            .block,
+                            .block_two,
+                            .block_semicolon,
+                            .block_two_semicolon,
+                            => {
+                                // Ensure it's a labeled block form (blk: { ... }) to be used as expression
+                                if (ast.blockLabel(tree, n) != null and !has_return and !has_defer) {
+                                    selection_is_expression = true;
+                                }
+                            },
+                            else => {},
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Depending on mode, prepare the body text and the replacement range.
+        var body_start_index: usize = undefined;
+        var body_end_index: usize = undefined;
+        var call_replace_loc: offsets.Loc = .{ .start = start_index, .end = loc.end };
+        var expr_text: []const u8 = &.{};
+        var is_statements: bool = false;
+        // Optional single-output info (v1)
+        var output_name: ?[]const u8 = null;
+        var output_decl: ?Analyser.DeclWithHandle = null;
+        var output_stmt: Ast.Node.Index = .root;
+        var output_lhs_token: ?Ast.TokenIndex = null;
+        var output_rhs: ?Ast.Node.Index = null;
+
+        if (selection_is_expression) {
+            expr_text = source[start_index..end_index];
+            if (expr_text.len == 0) return;
+            body_start_index = start_index;
+            body_end_index = end_index;
+        } else {
+            // Attempt statements extraction: detect contiguous statements inside the same enclosing block.
+            const doc_scope = try builder.handle.getDocumentScope();
+            const start_block = Analyser.innermostScopeAtIndexWithTag(doc_scope, start_index, .initOne(.block)).unwrap() orelse return;
+            const end_block = Analyser.innermostScopeAtIndexWithTag(doc_scope, end_index - 1, .initOne(.block)).unwrap() orelse return;
+            if (@intFromEnum(start_block) != @intFromEnum(end_block)) return;
+            const block_node = DocumentScope.getScopeAstNode(doc_scope, start_block).?;
+            var buf: [2]Ast.Node.Index = undefined;
+            const statements = tree.blockStatements(&buf, block_node) orelse return; // only inside proper blocks
+
+            // Find contiguous statements fully covered by selection.
+            var first_idx: usize = statements.len;
+            var last_idx: usize = 0;
+            for (statements, 0..) |stmt, idx| {
+                const stmt_loc = offsets.nodeToLoc(tree, stmt);
+                if (stmt_loc.end <= start_index or end_index <= stmt_loc.start) continue;
+                // if any partial overlap, require full coverage for v1
+                if (!(start_index <= stmt_loc.start and stmt_loc.end <= end_index)) return;
+                if (first_idx == statements.len) first_idx = idx;
+                last_idx = idx;
+            }
+            if (first_idx == statements.len) return; // no statements covered
+            // Ensure contiguity: there must be no gaps between first_idx and last_idx
+            // since we required full coverage and overlap, this is implicit.
+
+            // v1 restriction: reject if any var decl inside the selection
+            for (statements[first_idx .. last_idx + 1]) |stmt| {
+                switch (tree.nodeTag(stmt)) {
+                    .local_var_decl, .simple_var_decl, .aligned_var_decl => return,
+                    else => {},
+                }
+            }
+
+            // Collect single external assignment as output (v1). Must be last selected statement.
+            for (statements[first_idx .. last_idx + 1], first_idx..) |stmt, idx| {
+                if (tree.nodeTag(stmt) == .assign) {
+                    const lhs, const rhs = tree.nodeData(stmt).node_and_node;
+                    if (tree.nodeTag(lhs) != .identifier) continue;
+                    const name_tok = tree.nodeMainToken(lhs);
+                    const name = offsets.identifierTokenToNameSlice(tree, name_tok);
+                    // declaration must be outside selection to consider as output
+                    const decl = (try builder.analyser.lookupSymbolGlobal(builder.handle, name, tree.tokenStart(name_tok))) orelse continue;
+                    const decl_tok = decl.nameToken();
+                    const decl_loc = offsets.tokenToLoc(tree, decl_tok);
+                    if (start_index <= decl_loc.start and decl_loc.end <= end_index) continue; // declared inside -> not output
+
+                    // Only allow exactly one output and it must be the last selected statement
+                    if (output_name != null) return;
+                    if (idx != last_idx) return;
+                    output_name = name;
+                    output_decl = decl;
+                    output_stmt = stmt;
+                    output_lhs_token = name_tok;
+                    output_rhs = rhs;
+                }
+            }
+
+            // Determine replacement range bounds based on selected statements
+            const first_stmt = statements[first_idx];
+            const last_stmt = statements[last_idx];
+            const first_loc = offsets.nodeToLoc(tree, first_stmt);
+            var last_loc = offsets.nodeToLoc(tree, last_stmt);
+            // Include a trailing semicolon if present immediately after the last token
+            const last_tok = ast.lastToken(tree, last_stmt);
+            if (last_tok + 1 < tree.tokens.len and tree.tokenTag(last_tok + 1) == .semicolon) {
+                const semi_loc = offsets.tokensToLoc(tree, last_tok + 1, last_tok + 1);
+                if (semi_loc.end > last_loc.end) last_loc.end = semi_loc.end;
+            }
+            // Extend to end-of-line whitespace
+            var scan_end = last_loc.end;
+            while (scan_end < source.len and (source[scan_end] == ' ' or source[scan_end] == '\t')) scan_end += 1;
+            if (scan_end < source.len and source[scan_end] == '\n') scan_end += 1;
+            last_loc.end = scan_end;
+
+            body_start_index = first_loc.start;
+            body_end_index = last_loc.end;
+            call_replace_loc = .{ .start = body_start_index, .end = body_end_index };
+            is_statements = true;
+        }
 
         // Collect external identifiers to use as parameters
         var seen_params = std.StringHashMapUnmanaged(void){};
@@ -183,6 +305,11 @@ pub const Builder = struct {
         var param_names: std.ArrayList([]const u8) = .empty;
         var param_decls: std.ArrayList(Analyser.DeclWithHandle) = .empty;
 
+        // Recompute tokens if statements mode adjusted boundaries
+        if (is_statements) {
+            left_token = offsets.sourceIndexToTokenIndex(tree, body_start_index).preferRight(&tree);
+            right_token = offsets.sourceIndexToTokenIndex(tree, body_end_index).preferLeft();
+        }
         i = left_token;
         while (i <= right_token) : (i += 1) {
             const tag = tree.tokenTag(i);
@@ -197,6 +324,15 @@ pub const Builder = struct {
             const decl_token = decl.nameToken();
             const decl_loc = offsets.tokenToLoc(tree, decl_token);
             if (decl_loc.start >= start_index and decl_loc.end <= end_index) continue;
+
+            // If this identifier is the output LHS, don't treat as input param
+            if (output_lhs_token) |lhs_tok| {
+                if (i == lhs_tok) continue;
+                // Also disallow other reads of the output variable in selection for v1
+                if (output_name) |oname| {
+                    if (std.mem.eql(u8, name, oname)) return; // reading output var not supported yet
+                }
+            }
 
             // If declaration is static/global or container field, it is accessible without params
             const is_static = blk: {
@@ -214,8 +350,72 @@ pub const Builder = struct {
             }
         }
 
-        // Determine target container and function name avoiding conflicts
+        // Determine target container for context
         const container_ty = try builder.analyser.innermostContainer(builder.handle, start_index);
+
+        // Order parameters heuristically: self-like first, then allocator, then mutable struct pointers, then immutable struct pointers, then then others by appearance.
+        if (param_names.items.len > 1) {
+            const Entry = struct { idx: usize, score: u32, appear: usize };
+            var entries: std.ArrayList(Entry) = .empty;
+            try entries.ensureTotalCapacity(builder.arena, param_names.items.len);
+            const container_instance = (try container_ty.instanceTypeVal(builder.analyser)) orelse container_ty;
+            for (param_names.items, 0..) |_, idx| {
+                var score: u32 = 0;
+                const decl = param_decls.items[idx];
+                if (try decl.resolveType(builder.analyser)) |ty| {
+                    if (ty.is_type_val) {
+                        score += 1000;
+                    }
+
+                    switch (ty.data) {
+                        .pointer => |info| {
+                            // Highest: pointer to the current container instance
+                            if (info.elem_ty.eql(container_instance)) score += 2000;
+                            switch (info.elem_ty.data) {
+                                .container => {
+                                    if (info.is_const) {
+                                        score += 800;
+                                    } else {
+                                        score += 100;
+                                    }
+                                },
+                                else => score += 100,
+                            }
+                        },
+                        .container => |info| {
+                            _ = info; // autofix
+                            score += 700;
+                        },
+                        else => {},
+                    }
+                    const type_str = ty.stringifyTypeOf(builder.analyser, .{ .truncate_container_decls = false }) catch null;
+                    if (type_str) |ts| {
+                        if (std.mem.indexOf(u8, ts, "Allocator") != null) score += 950;
+                    }
+                }
+                entries.appendAssumeCapacity(.{ .idx = idx, .score = score, .appear = idx });
+            }
+            const Ctx = struct {
+                fn lessThan(_: void, a: Entry, b: Entry) bool {
+                    if (a.score != b.score) return a.score > b.score;
+                    return a.appear < b.appear;
+                }
+            };
+            std.mem.sort(Entry, entries.items, {}, Ctx.lessThan);
+
+            var new_names: std.ArrayList([]const u8) = .empty;
+            var new_decls: std.ArrayList(Analyser.DeclWithHandle) = .empty;
+            try new_names.ensureTotalCapacity(builder.arena, param_names.items.len);
+            try new_decls.ensureTotalCapacity(builder.arena, param_decls.items.len);
+            for (entries.items) |e| {
+                new_names.appendAssumeCapacity(param_names.items[e.idx]);
+                new_decls.appendAssumeCapacity(param_decls.items[e.idx]);
+            }
+            param_names.items = new_names.items;
+            param_decls.items = new_decls.items;
+        }
+
+        // Determine target container and function name avoiding conflicts
 
         const base_name: []const u8 = "extracted";
         var chosen_name = base_name;
@@ -227,9 +427,9 @@ pub const Builder = struct {
             chosen_name = buf;
         }
 
-        // Attempt to infer return type from the selected expression.
+        // Attempt to infer return type from the selected expression/statements.
         var inferred_return_type: ?[]const u8 = null;
-        {
+        if (!is_statements) {
             const mid_index = start_index + (end_index - start_index) / 2;
             const nodes = try ast.nodesOverlappingIndex(builder.arena, tree, mid_index);
             if (nodes.len != 0) {
@@ -278,9 +478,23 @@ pub const Builder = struct {
                     }
                 }
             }
+        } else {
+            // statements mode
+            if (output_decl) |od| {
+                // Prefer literal type if available
+                if (try od.typeDeclarationNode()) |tn| {
+                    inferred_return_type = offsets.nodeToSlice(tn.handle.tree, tn.node);
+                } else if (try od.resolveType(builder.analyser)) |ty| {
+                    inferred_return_type = try ty.stringifyTypeOf(builder.analyser, .{ .truncate_container_decls = false });
+                } else {
+                    inferred_return_type = null; // fallback later
+                }
+            } else {
+                inferred_return_type = "void";
+            }
         }
 
-        // Build function text: fn <name>(params) <ret> { return expr; }
+        // Build function text: fn <name>(params) <ret> { body }
         var fn_text: std.ArrayList(u8) = .empty;
         try fn_text.appendSlice(builder.arena, "fn ");
         try fn_text.appendSlice(builder.arena, chosen_name);
@@ -314,20 +528,82 @@ pub const Builder = struct {
             try fn_text.appendSlice(builder.arena, expr_text);
             try fn_text.appendSlice(builder.arena, ")");
         }
-        try fn_text.appendSlice(builder.arena, " {\n    return ");
-        try fn_text.appendSlice(builder.arena, expr_text);
-        try fn_text.appendSlice(builder.arena, ";\n}\n\n");
+        if (!is_statements) {
+            try fn_text.appendSlice(builder.arena, " {\n    return ");
+            try fn_text.appendSlice(builder.arena, source[body_start_index..body_end_index]);
+            try fn_text.appendSlice(builder.arena, ";\n}\n\n");
+        } else {
+            try fn_text.appendSlice(builder.arena, " {\n");
+            if (output_stmt != .root) {
+                const rhs_node = output_rhs orelse rhs_fallback: {
+                    // shouldn't happen, but keep body unchanged if missing
+                    try fn_text.appendSlice(builder.arena, source[body_start_index..body_end_index]);
+                    break :rhs_fallback @as(Ast.Node.Index, .root);
+                };
+                if (rhs_node != .root) {
+                const stmt_loc = offsets.nodeToLoc(tree, output_stmt);
+                const rhs_loc = offsets.nodeToLoc(tree, rhs_node);
+                // before stmt
+                try fn_text.appendSlice(builder.arena, source[body_start_index..stmt_loc.start]);
+                // return rhs;
+                try fn_text.appendSlice(builder.arena, "return ");
+                try fn_text.appendSlice(builder.arena, source[rhs_loc.start..rhs_loc.end]);
+                try fn_text.appendSlice(builder.arena, ";\n");
+                // after stmt
+                try fn_text.appendSlice(builder.arena, source[stmt_loc.end..body_end_index]);
+                } else {
+                try fn_text.appendSlice(builder.arena, source[body_start_index..body_end_index]);
+                }
+            } else {
+                try fn_text.appendSlice(builder.arena, source[body_start_index..body_end_index]);
+            }
+            if (source[body_end_index - 1] != '\n') try fn_text.append(builder.arena, '\n');
+            try fn_text.appendSlice(builder.arena, "}\n\n");
+        }
 
         // Build call replacement
         var call_text: std.ArrayList(u8) = .empty;
+        var instance_call = false;
+        var receiver_idx: usize = 0;
+        // Determine if any parameter is a (mutable) pointer to the current container instance type.
+        switch (container_ty.data) {
+            .container => |info| {
+                if (info.scope_handle.scope != .root) {
+                    const container_instance = (try container_ty.instanceTypeVal(builder.analyser)) orelse container_ty;
+                    for (param_decls.items, 0..) |d, idx| {
+                        if (try d.resolveType(builder.analyser)) |ty| {
+                            const deref = try builder.analyser.resolveDerefType(ty) orelse ty;
+                            if (deref.eql(container_instance)) {
+                                instance_call = true;
+                                receiver_idx = idx;
+                                break;
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        if (output_name) |oname| {
+            // assignment at callsite for outputs
+            try call_text.appendSlice(builder.arena, oname);
+            try call_text.appendSlice(builder.arena, " = ");
+        }
+        if (instance_call) try call_text.appendSlice(builder.arena, param_names.items[receiver_idx]);
+        if (instance_call) try call_text.appendSlice(builder.arena, ".");
         try call_text.appendSlice(builder.arena, chosen_name);
         try call_text.appendSlice(builder.arena, "(");
+        var wrote_any = false;
         for (param_names.items, 0..) |p, idx| {
-            if (idx != 0) try call_text.appendSlice(builder.arena, ", ");
+            if (instance_call and idx == receiver_idx) continue;
+            if (wrote_any) try call_text.appendSlice(builder.arena, ", ");
             try call_text.appendSlice(builder.arena, p);
+            wrote_any = true;
         }
         try call_text.appendSlice(builder.arena, ")");
-        if (has_trailing_semicolon) try call_text.append(builder.arena, ';');
+        // In expression mode, preserve trailing semicolon from original selection; in statements, we always insert one.
+        if (is_statements or has_trailing_semicolon) try call_text.append(builder.arena, ';');
+        if (is_statements) try call_text.append(builder.arena, '\n');
 
         // Choose insertion point: after enclosing function if available, else EOF
         var insert_index: usize = source.len;
@@ -356,7 +632,7 @@ pub const Builder = struct {
 
         var edits: std.ArrayList(types.TextEdit) = .empty;
         try edits.append(builder.arena, builder.createTextEditPos(insert_index, padded_fn_text.items));
-        try edits.append(builder.arena, builder.createTextEditLoc(.{ .start = start_index, .end = loc.end }, call_text.items));
+        try edits.append(builder.arena, builder.createTextEditLoc(call_replace_loc, call_text.items));
 
         try builder.actions.append(builder.arena, .{
             .title = "extract to function",
