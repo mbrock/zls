@@ -1646,9 +1646,17 @@ const GenerateHoistConstToFieldActionator = struct {
         const container_instance = (try container_ty.instanceTypeVal(this.builder.analyser)) orelse container_ty;
         _ = container_instance; // autofix
 
-        const has_self_param = try Analyser.hasSelfParam(this.builder.analyser, func_ty.?);
-        _ = has_self_param; // autofix
-        const receiver = func_ty.?.data.function.parameters[0].name.?;
+        // Only proceed for methods with a receiver parameter
+        const receiver = blk_recv: {
+            const ft = func_ty orelse break :blk_recv null;
+            if (ft.data != .function) break :blk_recv null;
+            const fndata = ft.data.function;
+            if (fndata.parameters.len == 0) break :blk_recv null;
+            const p0 = fndata.parameters[0];
+            if (p0.name) |nm| {
+                break :blk_recv nm;
+            } else break :blk_recv null;
+        } orelse return; // no receiver => not a method, skip this refactor
 
         // Prepare container field insertion (infer type)
         // Find enclosing container decl node
