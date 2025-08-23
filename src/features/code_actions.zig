@@ -10,6 +10,7 @@ const Analyser = @import("../analysis.zig");
 const ast = @import("../ast.zig");
 const types = @import("lsp").types;
 const offsets = @import("../offsets.zig");
+const Uri = @import("../uri.zig");
 const tracy = @import("tracy");
 
 pub const Builder = struct {
@@ -121,7 +122,13 @@ pub const Builder = struct {
             try generateMoveDeclToTopLevelAction(builder, source_index_mv);
         }
 
-        // 5) Existing string literal refactors (only when cursor is in a string)
+        // 4) Move top-level struct to new file
+        {
+            const source_index_struct = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
+            try generateMoveTopLevelStructToFileAction(builder, source_index_struct);
+        }
+
+        // 6) Existing string literal refactors (only when cursor is in a string)
         const source_index = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
         const ctx = try Analyser.getPositionContext(builder.arena, builder.handle.tree, source_index, true);
         if (ctx != .string_literal) return;
@@ -180,10 +187,25 @@ pub const Builder = struct {
         return .{ .range = .{ .start = position, .end = position }, .newText = new_text };
     }
 
-    pub fn createWorkspaceEdit(self: *Builder, edits: []const types.TextEdit) error{OutOfMemory}!types.WorkspaceEdit {
-        var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
-        try workspace_edit.changes.?.map.putNoClobber(self.arena, self.handle.uri, try self.arena.dupe(types.TextEdit, edits));
+    pub fn addWorkspaceTextEdit(
+        self: *Builder,
+        workspace_edit: *types.WorkspaceEdit,
+        uri: types.DocumentUri,
+        edits: []const types.TextEdit,
+    ) error{OutOfMemory}!void {
+        try workspace_edit.changes.?.map.putNoClobber(
+            self.arena,
+            uri,
+            try self.arena.dupe(types.TextEdit, edits),
+        );
+    }
 
+    pub fn createWorkspaceEdit(
+        self: *Builder,
+        edits: []const types.TextEdit,
+    ) error{OutOfMemory}!types.WorkspaceEdit {
+        var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+        try self.addWorkspaceTextEdit(&workspace_edit, self.handle.uri, edits);
         return workspace_edit;
     }
 };
@@ -437,11 +459,15 @@ fn handleUnusedFunctionParameter(builder: *Builder, loc: offsets.Loc) !void {
     if (builder.wantKind(.quickfix)) {
         // TODO add no `// autofix` comment
         // TODO fix formatting
+        var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+        try builder.addWorkspaceTextEdit(&workspace_edit, builder.handle.uri, &.{
+            builder.createTextEditLoc(getParamRemovalRange(tree, fn_proto_param), ""),
+        });
         try builder.actions.append(builder.arena, .{
             .title = "remove function parameter",
             .kind = .quickfix,
             .isPreferred = false,
-            .edit = try builder.createWorkspaceEdit(&.{builder.createTextEditLoc(getParamRemovalRange(tree, fn_proto_param), "")}),
+            .edit = workspace_edit,
         });
     }
 }
@@ -481,11 +507,15 @@ fn handleUnusedVariableOrConstant(builder: *Builder, loc: offsets.Loc) !void {
 
     if (builder.wantKind(.quickfix)) {
         // TODO add no `// autofix` comment
+        var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+        try builder.addWorkspaceTextEdit(&workspace_edit, builder.handle.uri, &.{
+            builder.createTextEditPos(insert_index, new_text),
+        });
         try builder.actions.append(builder.arena, .{
             .title = "discard value",
             .kind = .quickfix,
             .isPreferred = true,
-            .edit = try builder.createWorkspaceEdit(&.{builder.createTextEditPos(insert_index, new_text)}),
+            .edit = workspace_edit,
         });
     }
 }
@@ -750,7 +780,8 @@ fn handleUnorganizedImport(builder: *Builder) !void {
         }
     }
 
-    const workspace_edit = try builder.createWorkspaceEdit(edits.items);
+    var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+    try builder.addWorkspaceTextEdit(&workspace_edit, builder.handle.uri, edits.items);
 
     try builder.actions.append(builder.arena, .{
         .title = "organize @import",
@@ -1378,15 +1409,180 @@ const GenerateMoveDeclToTopLevelActionator = struct {
             if (semi_loc.end > decl_loc.end) decl_loc.end = semi_loc.end;
         }
 
-        var edits: std.ArrayList(types.TextEdit) = .empty;
-        try edits.append(this.builder.arena, this.builder.createTextEditPos(tree.source.len, top_text.items));
-        try edits.append(this.builder.arena, this.builder.createTextEditLoc(decl_loc, ""));
+        // Multi-doc workspace edit: append new top-level const and remove local decl
+        var we: types.WorkspaceEdit = .{ .changes = .{} };
+        var cur_edits = try this.builder.arena.alloc(types.TextEdit, 2);
+        // append at EOF and remove local decl
+        cur_edits[0] = this.builder.createTextEditPos(tree.source.len, top_text.items);
+        cur_edits[1] = this.builder.createTextEditLoc(decl_loc, "");
+        try we.changes.?.map.put(this.builder.arena, this.builder.handle.uri, cur_edits);
 
         try this.builder.actions.append(this.builder.arena, .{
             .title = try std.fmt.allocPrint(this.builder.arena, "move '{s}' to top level", .{name}),
             .kind = .refactor,
             .isPreferred = false,
-            .edit = try this.builder.createWorkspaceEdit(edits.items),
+            .edit = we,
+        });
+    }
+};
+
+fn generateMoveTopLevelStructToFileAction(builder: *Builder, source_index: usize) !void {
+    var args = GenerateMoveTopLevelStructToFileActionator{ .builder = builder, .source_index = source_index };
+    _ = try args.generateMoveTopLevelStructToFileAction();
+}
+
+pub const GenerateMoveTopLevelStructToFileActionator = struct {
+    builder: *Builder,
+    source_index: usize,
+
+    pub fn generateMoveTopLevelStructToFileAction(this: *@This()) !void {
+        const tracy_zone = tracy.trace(@src());
+        defer tracy_zone.end();
+
+        if (!this.builder.wantKind(.refactor)) return;
+
+        const tree = this.builder.handle.tree;
+        const nodes = try ast.nodesOverlappingIndex(this.builder.arena, tree, this.source_index);
+        if (nodes.len == 0) return;
+
+        var top_decl: ?Ast.Node.Index = null;
+        for (nodes) |n| {
+            if (tree.nodeTag(n) == .global_var_decl) {
+                top_decl = n;
+                break;
+            }
+            if (tree.nodeTag(n) == .simple_var_decl) {
+                if (tree.fullVarDecl(n)) |v| {
+                    if (tree.tokenTag(v.ast.mut_token) == .keyword_const) {
+                        top_decl = n;
+                        break;
+                    }
+                }
+            }
+        }
+        const decl_node = top_decl orelse return;
+        const v = tree.fullVarDecl(decl_node).?;
+        if (tree.tokenTag(v.ast.mut_token) != .keyword_const) return;
+        const init = v.ast.init_node.unwrap() orelse return;
+        if (tree.tokenTag(tree.nodeMainToken(init)) != .keyword_struct) return;
+        const name_tok = v.ast.mut_token + 1;
+        if (tree.tokenTag(name_tok) != .identifier) return;
+        const name = offsets.identifierTokenToNameSlice(tree, name_tok);
+        if (std.mem.eql(u8, name, "_")) return;
+
+        // New file content with alias prelude (std + referenced decls from any file)
+        const vis = if (v.visib_token != null) "pub " else "";
+        // Scan init subtree tokens for references
+        const init_first = tree.firstToken(init);
+        const init_last = ast.lastToken(tree, init);
+        var needs_std = false;
+        const Alias = struct { alias: []const u8, import_path: []const u8, symbol: []const u8 };
+        var aliases: std.ArrayList(Alias) = .empty;
+        var used_aliases: std.StringHashMapUnmanaged(void) = .empty;
+        defer used_aliases.deinit(this.builder.arena);
+        var tok = init_first;
+        while (tok <= init_last) : (tok += 1) {
+            if (tree.tokenTag(tok) != .identifier) continue;
+            const id_name = offsets.identifierTokenToNameSlice(tree, tok);
+            if (std.mem.eql(u8, id_name, "_")) continue;
+            if (std.mem.eql(u8, id_name, "std")) {
+                needs_std = true;
+                continue;
+            }
+            const ref_decl = (try this.builder.analyser.lookupSymbolGlobal(
+                this.builder.handle,
+                id_name,
+                tree.tokenStart(tok),
+            )) orelse continue;
+            const ref_name_tok = ref_decl.nameToken();
+            const ref_name = offsets.identifierTokenToNameSlice(tree, ref_name_tok);
+            if (std.mem.eql(u8, ref_name, name)) continue; // skip self
+
+            // Determine import path
+            const dep_uri = ref_decl.handle.uri;
+            var import_path: []const u8 = undefined;
+            if (std.mem.eql(u8, dep_uri, this.builder.handle.uri)) {
+                const cur_path = Uri.toFsPath(this.builder.arena, dep_uri) catch dep_uri;
+                import_path = std.fs.path.basename(cur_path);
+            } else {
+                // use absolute fs path for robustness
+                import_path = Uri.toFsPath(this.builder.arena, dep_uri) catch dep_uri;
+            }
+
+            // Ensure unique alias name
+            var alias_name = ref_name;
+            var suffix: usize = 1;
+            while (used_aliases.get(alias_name) != null) : (suffix += 1) {
+                alias_name = try std.fmt.allocPrint(this.builder.arena, "{s}{d}", .{ ref_name, suffix });
+            }
+            const gop = try used_aliases.getOrPut(this.builder.arena, alias_name);
+            if (!gop.found_existing) gop.key_ptr.* = alias_name;
+            try aliases.append(this.builder.arena, .{ .alias = alias_name, .import_path = import_path, .symbol = ref_name });
+        }
+
+        var file_text: std.ArrayList(u8) = .empty;
+        if (needs_std) {
+            try file_text.appendSlice(this.builder.arena, "const std = @import(\"std\");\n");
+        }
+        for (aliases.items) |a| {
+            try file_text.appendSlice(this.builder.arena, "const ");
+            try file_text.appendSlice(this.builder.arena, a.alias);
+            try file_text.appendSlice(this.builder.arena, " = @import(\"");
+            try file_text.appendSlice(this.builder.arena, a.import_path);
+            try file_text.appendSlice(this.builder.arena, "\").");
+            try file_text.appendSlice(this.builder.arena, a.symbol);
+            try file_text.appendSlice(this.builder.arena, ";\n");
+        }
+        if (needs_std or aliases.items.len != 0) try file_text.appendSlice(this.builder.arena, "\n");
+        try file_text.appendSlice(this.builder.arena, vis);
+        try file_text.appendSlice(this.builder.arena, "const ");
+        try file_text.appendSlice(this.builder.arena, name);
+        try file_text.appendSlice(this.builder.arena, " = ");
+        try file_text.appendSlice(this.builder.arena, offsets.nodeToSlice(tree, init));
+        try file_text.appendSlice(this.builder.arena, ";\n");
+
+        // Replace original with import alias
+        var replace_loc = offsets.nodeToLoc(tree, decl_node);
+        const end_tok = ast.lastToken(tree, decl_node);
+        if (end_tok + 1 < tree.tokens.len and tree.tokenTag(end_tok + 1) == .semicolon) {
+            const semi_loc = offsets.tokensToLoc(tree, end_tok + 1, end_tok + 1);
+            if (semi_loc.end > replace_loc.end) replace_loc.end = semi_loc.end;
+        }
+        var import_text: std.ArrayList(u8) = .empty;
+        try import_text.appendSlice(this.builder.arena, vis);
+        try import_text.appendSlice(this.builder.arena, "const ");
+        try import_text.appendSlice(this.builder.arena, name);
+        try import_text.appendSlice(this.builder.arena, " = @import(\"");
+        const filename = try std.fmt.allocPrint(this.builder.arena, "{s}.zig", .{name});
+        try import_text.appendSlice(this.builder.arena, filename);
+        try import_text.appendSlice(this.builder.arena, "\").");
+        try import_text.appendSlice(this.builder.arena, name);
+        try import_text.appendSlice(this.builder.arena, ";\n");
+
+        // Build proper URIs and documentChanges (CreateFile + TextDocumentEdits)
+        const cur_fs_path = Uri.toFsPath(this.builder.arena, this.builder.handle.uri) catch return;
+        const cur_dir = std.fs.path.dirname(cur_fs_path) orelse ".";
+        const new_fs_path = try std.fs.path.join(this.builder.arena, &.{ cur_dir, filename });
+        const new_uri = Uri.fromPath(this.builder.arena, new_fs_path) catch return;
+
+        var workspace_edit: types.WorkspaceEdit = .{};
+        workspace_edit.documentChanges = &.{
+            .{ .CreateFile = .{ .uri = new_uri } },
+            .{ .TextDocumentEdit = .{
+                .textDocument = .{ .uri = this.builder.handle.uri, .version = null },
+                .edits = &.{ .{ .TextEdit = this.builder.createTextEditLoc(replace_loc, import_text.items) } },
+            } },
+            .{ .TextDocumentEdit = .{
+                .textDocument = .{ .uri = new_uri, .version = null },
+                .edits = &.{ .{ .TextEdit = this.builder.createTextEditPos(0, file_text.items) } },
+            } },
+        };
+
+        try this.builder.actions.append(this.builder.arena, .{
+            .title = try std.fmt.allocPrint(this.builder.arena, "move to new {s}", .{filename}),
+            .kind = .refactor,
+            .isPreferred = false,
+            .edit = workspace_edit,
         });
     }
 };
@@ -1575,11 +1771,13 @@ const GenerateHoistConstToFieldActionator = struct {
             }
         }
         // Emit the action
+        var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+        try this.builder.addWorkspaceTextEdit(&workspace_edit, this.builder.handle.uri, repls.items);
         try this.builder.actions.append(this.builder.arena, .{
             .title = "hoist local to field",
             .kind = .refactor,
             .isPreferred = false,
-            .edit = try this.builder.createWorkspaceEdit(repls.items),
+            .edit = workspace_edit,
         });
     }
 };
@@ -1838,11 +2036,14 @@ const GenerateEncapsulateParamsStructActionator = struct {
             try edits.append(this.builder.arena, this.builder.createTextEditLoc(inner_loc, wrapper.items));
         }
 
+        var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+        try this.builder.addWorkspaceTextEdit(&workspace_edit, this.builder.handle.uri, edits.items);
+
         try this.builder.actions.append(this.builder.arena, .{
             .title = try std.fmt.allocPrint(this.builder.arena, "encapsulate params in struct '{s}'", .{struct_name}),
             .kind = .refactor,
             .isPreferred = false,
-            .edit = try this.builder.createWorkspaceEdit(edits.items),
+            .edit = workspace_edit,
         });
     }
 };
@@ -2432,15 +2633,17 @@ const GenerateExtractFunctionCodeActionator = struct {
         for (0..leading_needed) |_| padded_fn_text.appendAssumeCapacity('\n');
         padded_fn_text.appendSliceAssumeCapacity(fn_text.items);
 
-        var edits: std.ArrayList(types.TextEdit) = .empty;
-        try edits.append(this.builder.arena, this.builder.createTextEditPos(insert_index, padded_fn_text.items));
-        try edits.append(this.builder.arena, this.builder.createTextEditLoc(call_replace_loc, call_text.items));
+        var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+        try this.builder.addWorkspaceTextEdit(&workspace_edit, this.builder.handle.uri, &.{
+            this.builder.createTextEditPos(insert_index, padded_fn_text.items),
+            this.builder.createTextEditLoc(call_replace_loc, call_text.items),
+        });
 
         try this.builder.actions.append(this.builder.arena, .{
             .title = "extract to function",
             .kind = .refactor,
             .isPreferred = false,
-            .edit = try this.builder.createWorkspaceEdit(edits.items),
+            .edit = workspace_edit,
         });
     }
 };
