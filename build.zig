@@ -225,10 +225,30 @@ pub fn build(b: *Build) !void {
         const exe = b.addExecutable(.{
             .name = "zls",
             .root_module = exe_module,
-            .use_llvm = use_llvm,
-            .use_lld = use_llvm,
+            .use_llvm = use_llvm orelse false,
+            .use_lld = use_llvm orelse false,
         });
         b.installArtifact(exe);
+    }
+
+    { // zig build hover
+        const hover_tool = b.addExecutable(.{
+            .name = "hover",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/tools/hover_cli.zig"),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "zls", .module = zls_module },
+                },
+            }),
+            .use_llvm = use_llvm orelse false,
+            .use_lld = use_llvm orelse false,
+        });
+
+        const install_hover = b.addInstallArtifact(hover_tool, .{});
+        const hover_step = b.step("hover", "Build hover analysis tool");
+        hover_step.dependOn(&install_hover.step);
     }
 
     { // zig build check
