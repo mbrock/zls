@@ -613,6 +613,95 @@ pub fn callsiteReferences(
     return builder.callsites;
 }
 
+// Lightweight call graph collection for a single handle. Walks the AST once,
+// resolves callee decls for call expressions using the existing analyser, and
+// records caller -> callee edges. This is intended for batch analysis tools
+// (e.g. pagerank) to avoid invoking per-decl workspace searches repeatedly.
+pub const CallEdge = struct {
+    caller_uri: []const u8,
+    caller_fn_node: Ast.Node.Index,
+    call_node: Ast.Node.Index,
+    callee: Analyser.DeclWithHandle,
+};
+
+const CallGraphBuilder = struct {
+    allocator: std.mem.Allocator,
+    analyser: *Analyser,
+    edges: std.ArrayList(CallEdge) = .empty,
+
+    const Context = struct { builder: *CallGraphBuilder, handle: *DocumentStore.Handle };
+
+    fn deinit(self: *CallGraphBuilder) void {
+        self.edges.deinit(self.allocator);
+    }
+
+    fn add(self: *CallGraphBuilder, handle: *DocumentStore.Handle, call_node: Ast.Node.Index, callee: Analyser.DeclWithHandle) error{OutOfMemory}!void {
+        // Determine the caller function scope for the call node
+        const tree = handle.tree;
+        const call_tok = tree.nodeMainToken(call_node);
+        const src_index = tree.tokenStart(call_tok);
+        const doc_scope = handle.getDocumentScope() catch return; // ignore if scope unavailable
+        const maybe_scope = Analyser.innermostScopeAtIndexWithTag(doc_scope, src_index, .initOne(.function)).unwrap();
+        const scope_index = maybe_scope orelse return;
+        const scope_node = doc_scope.getScopeAstNode(scope_index) orelse return;
+        try self.edges.append(self.allocator, .{
+            .caller_uri = handle.uri,
+            .caller_fn_node = scope_node,
+            .call_node = call_node,
+            .callee = callee,
+        });
+    }
+
+    fn collectReferences(self: *CallGraphBuilder, handle: *DocumentStore.Handle, node: Ast.Node.Index) error{OutOfMemory}!void {
+        const context = Context{ .builder = self, .handle = handle };
+        try ast.iterateChildrenRecursive(handle.tree, node, &context, error{OutOfMemory}, referenceNode);
+    }
+
+    fn referenceNode(self: *const Context, tree: Ast, node: Ast.Node.Index) error{OutOfMemory}!void {
+        const builder = self.builder;
+        const handle = self.handle;
+        switch (tree.nodeTag(node)) {
+            .call, .call_comma, .call_one, .call_one_comma => {
+                var buf: [1]Ast.Node.Index = undefined;
+                const call = tree.fullCall(&buf, node).?;
+                const called_node = call.ast.fn_expr;
+                switch (tree.nodeTag(called_node)) {
+                    .identifier => {
+                        const ident_tok = ast.identifierTokenFromIdentifierNode(tree, called_node) orelse return;
+                        const child = (try builder.analyser.lookupSymbolGlobal(
+                            handle,
+                            offsets.identifierTokenToNameSlice(tree, ident_tok),
+                            tree.tokenStart(ident_tok),
+                        )) orelse return;
+                        try builder.add(handle, node, child);
+                    },
+                    .field_access => {
+                        const lhs_node, const field_name = tree.nodeData(called_node).node_and_token;
+                        const lhs = (try builder.analyser.resolveTypeOfNode(.of(lhs_node, handle))) orelse return;
+                        const deref_lhs = try builder.analyser.resolveDerefType(lhs) orelse lhs;
+                        const symbol = offsets.tokenToSlice(tree, field_name);
+                        const child = (try deref_lhs.lookupSymbol(builder.analyser, symbol)) orelse return;
+                        try builder.add(handle, node, child);
+                    },
+                    else => {},
+                }
+            },
+            else => {},
+        }
+    }
+};
+
+pub fn collectCallEdgesInHandle(
+    allocator: std.mem.Allocator,
+    analyser: *Analyser,
+    handle: *DocumentStore.Handle,
+) error{OutOfMemory}!std.ArrayList(CallEdge) {
+    var b = CallGraphBuilder{ .allocator = allocator, .analyser = analyser };
+    errdefer b.deinit();
+    try b.collectReferences(handle, .root);
+    return b.edges;
+}
+
 pub const GeneralReferencesRequest = union(enum) {
     rename: types.RenameParams,
     references: types.ReferenceParams,
