@@ -15,6 +15,7 @@ const hover_util = @import("hover/util.zig");
 const hover_server = @import("hover/server.zig");
 const hover_opts = @import("hover/options.zig");
 const hover_symbols = @import("hover/symbols.zig");
+const hover_pagerank = @import("hover/pagerank.zig");
 
 // TODO: When ZLS exposes symbol→decl mapping and structured signature/type
 // APIs, migrate printing to use those directly for richer details (visibility,
@@ -441,27 +442,23 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
         const p = files.items[i];
         const content = std.fs.cwd().readFileAlloc(allocator, p, std.math.maxInt(usize)) catch continue;
         const h = openDocument(server, allocator, p, content) catch continue;
-        const ds = server.sendRequestSync(allocator, "textDocument/documentSymbol", .{ .textDocument = .{ .uri = h.uri } }) catch continue;
-        if (ds) |resp| switch (resp) {
-            .array_of_DocumentSymbol => |arr| {
-                for (arr) |s| {
-                    if (!(s.kind == .Function or s.kind == .Method)) continue;
-                    const key = std.fmt.allocPrint(allocator, "{s}:{d}", .{ h.uri, s.selectionRange.start.line }) catch continue;
-                    if (index_by_key.get(key)) |_| { continue; }
-                    const node = PRNode{
-                        .name = allocator.dupe(u8, s.name) catch continue,
-                        .kind = s.kind,
-                        .uri = allocator.dupe(u8, h.uri) catch continue,
-                        .pos = s.selectionRange.start,
-                        .out_edges = .empty,
-                    };
-                    const idx: u32 = @intCast(nodes.items.len);
-                    nodes.append(allocator, node) catch break;
-                    index_by_key.put(key, idx) catch {};
-                }
-            },
-            else => {},
-        };
+        // Use internal symbol builder directly (no LSP roundtrip)
+        const arr = zls.document_symbol.getDocumentSymbols(allocator, h.tree, server.offset_encoding) catch continue;
+        for (arr) |s| {
+            if (!(s.kind == .Function or s.kind == .Method)) continue;
+            const key = std.fmt.allocPrint(allocator, "{s}:{d}", .{ h.uri, s.selectionRange.start.line }) catch continue;
+            if (index_by_key.get(key)) |_| { continue; }
+            const node = PRNode{
+                .name = allocator.dupe(u8, s.name) catch continue,
+                .kind = s.kind,
+                .uri = allocator.dupe(u8, h.uri) catch continue,
+                .pos = s.selectionRange.start,
+                .out_edges = .empty,
+            };
+            const idx: u32 = @intCast(nodes.items.len);
+            nodes.append(allocator, node) catch break;
+            index_by_key.put(key, idx) catch {};
+        }
     }
     
     const node_build_time = timer.lap();
@@ -483,11 +480,13 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
         
         // Time the reference request
         const ref_start = timer.read();
-        const refs = server.sendRequestSync(allocator, "textDocument/references", .{
+        // Use internal references handler directly (no LSP transport)
+        const refs_response = zls.references.referencesHandler(server, allocator, .{ .references = .{
             .textDocument = .{ .uri = n.uri },
             .position = n.pos,
             .context = .{ .includeDeclaration = false },
-        }) catch continue;
+        } }) catch continue;
+        const refs = if (refs_response) |rep| rep.references else null;
         total_ref_requests += 1;
         const ref_time = timer.read() - ref_start;
         
@@ -501,16 +500,11 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
                         cache_hits += 1;
                         break :blk arr;
                     }
-                    const h = server.document_store.getOrLoadHandle(caller_uri) orelse break :blk &[_]types.DocumentSymbol{};
-                    const ds = server.sendRequestSync(allocator, "textDocument/documentSymbol", .{ .textDocument = .{ .uri = h.uri } }) catch break :blk &[_]types.DocumentSymbol{};
+                    const h2 = server.document_store.getOrLoadHandle(caller_uri) orelse break :blk &[_]types.DocumentSymbol{};
+                    const arr2 = zls.document_symbol.getDocumentSymbols(allocator, h2.tree, server.offset_encoding) catch break :blk &[_]types.DocumentSymbol{};
                     total_symbol_requests += 1;
-                    if (ds) |resp| switch (resp) {
-                        .array_of_DocumentSymbol => |arr| {
-                            _ = syms_cache.put(allocator.dupe(u8, caller_uri) catch break :blk arr, arr) catch {};
-                            break :blk arr;
-                        },
-                        else => break :blk &[_]types.DocumentSymbol{},
-                    } else break :blk &[_]types.DocumentSymbol{};
+                    _ = syms_cache.put(allocator.dupe(u8, caller_uri) catch break :blk arr2, arr2) catch {};
+                    break :blk arr2;
                 };
                 _ = timer.read() - sym_start; // sym_time unused
                 
@@ -706,7 +700,7 @@ pub fn main() !u8 {
             return 0;
         },
         .pagerank => {
-            handlePagerank(allocator, server, parsed.file) catch |e| {
+            hover_pagerank.pagerank(server, allocator, parsed.file) catch |e| {
                 outPrint("Pagerank error: {any}\n", .{e});
                 return 1;
             };
