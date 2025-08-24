@@ -11,19 +11,16 @@
 const std = @import("std");
 const zls = @import("zls");
 const types = zls.lsp.types;
-const DiffMatchPatch = @import("diffz");
+const hover_util = @import("hover/util.zig");
+const hover_server = @import("hover/server.zig");
+const hover_opts = @import("hover/options.zig");
+const hover_symbols = @import("hover/symbols.zig");
 
 // TODO: When ZLS exposes symbol→decl mapping and structured signature/type
 // APIs, migrate printing to use those directly for richer details (visibility,
 // attributes, fully-qualified types) without additional AST probing here.
 
-fn outPrint(comptime fmt: []const u8, args: anytype) void {
-    var buf: [4096]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    _ = std.fmt.format(fbs.writer(), fmt, args) catch return;
-    const slice = fbs.getWritten();
-    _ = std.posix.write(std.posix.STDOUT_FILENO, slice) catch {};
-}
+const outPrint = hover_util.outPrint;
 
 const Usage =
     \\\hover - Simple ZLS helper
@@ -49,14 +46,7 @@ const Usage =
 
 const Command = enum { info, symbols, report, pagerank, xref, actions, apply, refactor };
 
-const SymbolsOptions = struct {
-    show_public: bool = true,
-    show_private: bool = false,
-    show_imports: bool = true,
-    show_locations: bool = false,
-    api_only: bool = false,
-    minimal: bool = false,
-};
+const SymbolsOptions = hover_opts.SymbolsOptions;
 
 fn parseArgs(allocator: std.mem.Allocator) !struct {
     cmd: Command,
@@ -259,199 +249,23 @@ fn freeArgs(_: std.mem.Allocator, _: [][:0]u8) void {
     // Program-scoped arena: no-op deallocation
 }
 
-fn initServer(allocator: std.mem.Allocator, markdown: bool) !*zls.Server {
-    // Minimal config manager; use defaults
-    // Use the program-scoped allocator for config as well
-    const cfg_manager = zls.configuration.Manager.init(allocator);
+const initServer = hover_server.initServer;
 
-    const server = try zls.Server.create(.{
-        .allocator = allocator,
-        .transport = null,
-        .config = null,
-        .config_manager = cfg_manager,
-    });
-    errdefer server.destroy();
+const openDocument = hover_server.openDocument;
 
-    // Initialize with markdown hover support if requested
-    var init_params: types.InitializeParams = .{ .capabilities = .{} };
-    if (markdown) {
-        init_params.capabilities.textDocument = .{ .hover = .{ .contentFormat = &[_]types.MarkupKind{ .markdown } } };
-    }
-    _ = try server.sendRequestSync(allocator, "initialize", init_params);
-    _ = try server.sendNotificationSync(allocator, "initialized", .{});
+const analyzeSymbolsWithZLS = hover_symbols.analyzeSymbolsWithZLS;
 
-    return server;
-}
+// moved to hover/symbols.zig
 
-fn openDocument(server: *zls.Server, arena: std.mem.Allocator, file_path: []const u8, content: []const u8) !*zls.DocumentStore.Handle {
-    const abs = try std.fs.cwd().realpathAlloc(arena, file_path);
-    const uri = try zls.URI.fromPath(arena, abs);
-
-    const params: types.DidOpenTextDocumentParams = .{
-        .textDocument = .{ .uri = uri, .languageId = "zig", .version = 0, .text = content },
-    };
-    try server.sendNotificationSync(arena, "textDocument/didOpen", params);
-    return server.document_store.getHandle(uri).?;
-}
-
-fn analyzeSymbolsWithZLS(allocator: std.mem.Allocator, server: *zls.Server, handle: *zls.DocumentStore.Handle, opts: SymbolsOptions) !void {
-    // Get imports using ZLS's function
-    if (opts.show_imports) {
-        var imports = try zls.Analyser.collectImports(allocator, handle.tree);
-        defer imports.deinit(allocator);
-        
-        if (imports.items.len > 0) {
-            outPrint("Imports:\n", .{});
-            for (imports.items) |import_path| {
-                outPrint("  {s}\n", .{import_path});
-            }
-            outPrint("\n", .{});
-        }
-    }
-    
-    // Use ZLS's document symbols - it already has perfect hierarchical structure!
-    const symbols = try zls.document_symbol.getDocumentSymbols(
-        allocator,
-        handle.tree,
-        server.offset_encoding
-    );
-    
-    // Display the symbols using ZLS's perfect data, passing handle for AST access
-    try displaySymbolsHierarchically(symbols, handle, opts);
-}
-
-fn displaySymbolsHierarchically(symbols: []const types.DocumentSymbol, handle: *zls.DocumentStore.Handle, opts: SymbolsOptions) !void {
-    // Use arena allocator for temporary allocations
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
-    
-    // Separate into categories
-    var containers: std.ArrayList(types.DocumentSymbol) = .empty;
-    var functions: std.ArrayList(types.DocumentSymbol) = .empty;
-    var constants: std.ArrayList(types.DocumentSymbol) = .empty;
-    
-    for (symbols) |symbol| {
-        // A Constant with children is actually a container type (struct/enum/union)
-        if (symbol.kind == .Constant and symbol.children != null and symbol.children.?.len > 0) {
-            try containers.append(allocator, symbol);
-        } else {
-            switch (symbol.kind) {
-                .Struct, .Class, .Interface, .Enum, .Namespace => try containers.append(allocator, symbol),
-                .Function, .Method, .Constructor => try functions.append(allocator, symbol),
-                .Constant, .Variable => try constants.append(allocator, symbol),
-                else => {},
-            }
-        }
-    }
-    
-    // Print Types with their hierarchical structure
-    if (containers.items.len > 0) {
-        outPrint("Types:\n", .{});
-        for (containers.items) |container| {
-            try printContainerWithStructure(container, handle);
-        }
-        outPrint("\n", .{});
-    }
-    
-    // Print Functions with structured signatures
-    if (functions.items.len > 0) {
-        outPrint("Functions:\n", .{});
-        for (functions.items) |func| {
-            try printStructuredFunction(func, handle);
-        }
-        outPrint("\n", .{});
-    }
-    
-    // Print Constants (skip import constants)
-    if (!opts.api_only and !opts.minimal and constants.items.len > 0) {
-        outPrint("Constants:\n", .{});
-        for (constants.items) |constant| {
-            // Skip obvious imports
-            if (std.mem.eql(u8, constant.name, "std") or 
-                std.mem.eql(u8, constant.name, "builtin") or
-                std.mem.endsWith(u8, constant.name, ".zig")) continue;
-            outPrint("  {s}\n", .{constant.name});
-        }
-    }
-}
-
-fn printContainerWithStructure(container: types.DocumentSymbol, handle: *zls.DocumentStore.Handle) !void {
-    // Determine container type - ZLS already knows!
-    const container_type = if (container.kind == .Struct) "struct" 
-                         else if (container.kind == .Enum) "enum"
-                         else if (container.kind == .Class or container.kind == .Interface) "interface"
-                         else "struct"; // For Constants that are actually containers
-    
-    outPrint("  {s} ({s})\n", .{container.name, container_type});
-    
-    // Print the hierarchical structure ZLS already parsed!
-    if (container.children) |children| {
-        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-        defer arena.deinit();
-        const allocator = arena.allocator();
-        
-        var fields: std.ArrayList(types.DocumentSymbol) = .empty;
-        var methods: std.ArrayList(types.DocumentSymbol) = .empty;
-        var enum_values: std.ArrayList(types.DocumentSymbol) = .empty;
-        
-        // Categorize children
-        for (children) |child| {
-            switch (child.kind) {
-                .Field, .Property => try fields.append(allocator, child),
-                .Function, .Method, .Constructor => try methods.append(allocator, child),
-                .EnumMember => try enum_values.append(allocator, child),
-                else => {},
-            }
-        }
-        
-        // Print fields
-        if (fields.items.len > 0) {
-            outPrint("    Fields:\n", .{});
-            for (fields.items) |field| {
-                outPrint("      {s}\n", .{field.name});
-            }
-        }
-        
-        // Print enum values  
-        if (enum_values.items.len > 0) {
-            outPrint("    Values:\n", .{});
-            for (enum_values.items) |value| {
-                outPrint("      {s}\n", .{value.name});
-            }
-        }
-        
-        // Print methods with structured signatures
-        if (methods.items.len > 0) {
-            outPrint("    Methods:\n", .{});
-            for (methods.items) |method| {
-                try printStructuredMethod(method, handle);
-            }
-        }
-    }
-}
+// moved to hover/symbols.zig
 
 
 // Print a top-level function symbol with its structured signature when available.
 // Leverages symbol.detail which document_symbol fills using ZLS analysis.
-fn printStructuredFunction(sym: types.DocumentSymbol, handle: *zls.DocumentStore.Handle) !void {
-    _ = handle; // not needed currently; keep for future AST-aware enhancements
-    if (sym.detail) |d| {
-        outPrint("  {s}: {s}\n", .{ sym.name, d });
-    } else {
-        outPrint("  {s}\n", .{ sym.name });
-    }
-}
+// moved to hover/symbols.zig
 
 // Print a method inside a container with indentation and signature when available.
-fn printStructuredMethod(sym: types.DocumentSymbol, handle: *zls.DocumentStore.Handle) !void {
-    _ = handle;
-    if (sym.detail) |d| {
-        outPrint("      {s}: {s}\n", .{ sym.name, d });
-    } else {
-        outPrint("      {s}\n", .{ sym.name });
-    }
-}
+// moved to hover/symbols.zig
 
 
 
@@ -460,153 +274,21 @@ fn printStructuredMethod(sym: types.DocumentSymbol, handle: *zls.DocumentStore.H
 
 
 
-fn printSymbolsEnhanced(allocator: std.mem.Allocator, server: *zls.Server, handle: *zls.DocumentStore.Handle, root: []const types.DocumentSymbol, opts: SymbolsOptions) void {
-    // Use ZLS's own implementations instead of reimplementing!
-    analyzeSymbolsWithZLS(allocator, server, handle, opts) catch |err| {
-        std.debug.print("Error analyzing symbols: {any}\n", .{err});
-        // Fallback to simplified method if ZLS analysis fails
-        printSymbolsFallback(root, opts);
-    };
-}
+// moved to hover/symbols.zig
 
-fn printSymbolsFallback(root: []const types.DocumentSymbol, opts: SymbolsOptions) void {
-    // Simplified fallback - just show the basic symbol names
-    for (root) |sym| {
-        switch (sym.kind) {
-            .Function, .Method, .Constructor => {
-                if (opts.show_public or opts.show_private) {
-                    outPrint("  {s} (fn)\n", .{sym.name});
-                }
-            },
-            .Struct, .Class, .Interface, .Enum => {
-                if (opts.show_public or opts.show_private) {
-                    outPrint("  {s} (type)\n", .{sym.name});
-                }
-            },
-            .Constant => {
-                if (!opts.api_only and !opts.minimal) {
-                    outPrint("  {s} (const)\n", .{sym.name});
-                }
-            },
-            else => {},
-        }
-    }
-}
+// moved to hover/symbols.zig
 
 
 
-fn printSymbols(allocator: std.mem.Allocator, server: *zls.Server, handle: *zls.DocumentStore.Handle, root: []const types.DocumentSymbol, opts: SymbolsOptions) void {
-    printSymbolsEnhanced(allocator, server, handle, root, opts);
-}
+const printSymbols = hover_symbols.printSymbols;
 
-fn printSymbolInformation(infos: []const types.SymbolInformation) void {
-    var structs_count: u32 = 0;
-    var functions_count: u32 = 0;
-    var constants_count: u32 = 0;
-    
-    // Count each type first
-    for (infos) |sym| {
-        switch (sym.kind) {
-            .Struct, .Class, .Interface => structs_count += 1,
-            .Function, .Method, .Constructor => functions_count += 1,
-            .Constant => constants_count += 1,
-            else => {},
-        }
-    }
-    
-    // Print organized sections
-    if (structs_count > 0) {
-        outPrint("\n📦 Structs & Types:\n", .{});
-        for (infos) |sym| {
-            if (sym.kind == .Struct or sym.kind == .Class or sym.kind == .Interface) {
-                printSymbolInfoWithLocation(sym);
-            }
-        }
-    }
-    
-    if (functions_count > 0) {
-        outPrint("\n🔧 Functions & Methods:\n", .{});
-        for (infos) |sym| {
-            if (sym.kind == .Function or sym.kind == .Method or sym.kind == .Constructor) {
-                printSymbolInfoWithLocation(sym);
-            }
-        }
-    }
-    
-    if (constants_count > 0) {
-        outPrint("\n📌 Constants:\n", .{});
-        for (infos) |sym| {
-            if (sym.kind == .Constant) {
-                printSymbolInfoWithLocation(sym);
-            }
-        }
-    }
-    
-    // Print other symbols
-    outPrint("\n📝 Other:\n", .{});
-    for (infos) |sym| {
-        switch (sym.kind) {
-            .Struct, .Class, .Interface, .Function, .Method, .Constructor, .Constant => {},
-            else => printSymbolInfoWithLocation(sym),
-        }
-    }
-}
+const printSymbolInformation = hover_symbols.printSymbolInformation;
 
-fn printSymbolInfoWithLocation(sym: types.SymbolInformation) void {
-    const line = sym.location.range.start.line + 1; // Convert to 1-based
-    const col = sym.location.range.start.character + 1; // Convert to 1-based
-    
-    const kind_icon = switch (sym.kind) {
-        .Function => "fn",
-        .Method => "fn", 
-        .Constructor => "fn",
-        .Struct => "struct",
-        .Class => "class",
-        .Interface => "interface",
-        .Enum => "enum",
-        .EnumMember => "•",
-        .Constant => "const",
-        .Variable => "var",
-        .Field => "field",
-        .Property => "prop",
-        else => "?",
-    };
-    
-    // Show visibility for public symbols
-    // This function is still using the fallback method
-    
-    // Format: [line:col] visibility kind name
-    outPrint("[{d:>3}:{d:<2}] {s:<8} {s}\n", .{ line, col, kind_icon, sym.name });
-}
+// moved to hover/symbols.zig
 
-fn printDiff(allocator: std.mem.Allocator, before: []const u8, after: []const u8, path: []const u8) void {
-    outPrint("--- {s}\n+++ {s}\n", .{ path, path });
-    var d = DiffMatchPatch{ .diff_timeout = 250 };
-    var diffs = d.diff(allocator, before, after, true) catch return;
-    defer DiffMatchPatch.deinitDiffList(allocator, &diffs);
-    var shown: usize = 0;
-    for (diffs.items) |df| {
-        const prefix: u8 = switch (df.operation) { .delete => '-', .insert => '+', .equal => ' ' };
-        var i: usize = 0;
-        while (i < df.text.len and shown < 4000) : (i += 120) {
-            const e = @min(i + 120, df.text.len);
-            outPrint("{c}{s}\n", .{ prefix, df.text[i..e] });
-            shown += e - i;
-        }
-        if (shown >= 4000) break;
-    }
-}
+const printDiff = hover_util.printDiff;
 
-fn runZigFmt(allocator: std.mem.Allocator, paths: []const []const u8) void {
-    if (paths.len == 0) return;
-    var argv = std.ArrayList([]const u8).init(allocator);
-    defer argv.deinit();
-    _ = argv.append("zig") catch return;
-    _ = argv.append("fmt") catch return;
-    for (paths) |p| _ = argv.append(p) catch {};
-    var child = std.process.Child.init(argv.items, allocator);
-    _ = child.spawnAndWait() catch {};
-}
+const runZigFmt = hover_util.runZigFmt;
 
 fn walkZigFiles(allocator: std.mem.Allocator, root_dir_path: []const u8, out_list: *std.ArrayList([]const u8)) !void {
     var stack: std.ArrayList([]const u8) = .empty;
@@ -940,10 +622,7 @@ fn listCodeActions(allocator: std.mem.Allocator, server: *zls.Server, file: []co
     if (count == 0) outPrint("No actions.\n", .{});
 }
 
-fn ensureDirForFile(path: []const u8) void {
-    const dir = std.fs.path.dirname(path) orelse return;
-    std.fs.cwd().makePath(dir) catch {};
-}
+const ensureDirForFile = hover_util.ensureDirForFile;
 
 fn applyWorkspaceEditToFs(allocator: std.mem.Allocator, server: *zls.Server, edit: types.WorkspaceEdit, dry_run: bool) !void {
     _ = dry_run; // suppress unused parameter warning
