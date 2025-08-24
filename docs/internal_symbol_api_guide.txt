@@ -1,0 +1,128 @@
+Internal ZLS APIs for Structured Symbol/Data Extraction (No LSP)
+
+Goal: Show how to obtain rich, structured information directly from ZLS internals (as used by the hover CLI), without sending LSP requests. This includes hierarchical symbols, container members (fields, methods, enum values), visibility, imports, signatures, doc comments, type resolution, and scope-aware symbol collection.
+
+Entry points used by the hover CLI live under `src/tools/hover_cli.zig`. The underlying APIs are in `src/features/document_symbol.zig`, `src/analysis.zig`, `src/DocumentStore.zig`, `src/offsets.zig`, and a few helpers in `src/ast.zig`.
+
+Key Concepts
+- Server: `zls.Server` exposes parsing, analysis, and stores opened documents.
+- Handle: `zls.DocumentStore.Handle` holds a parsed `Ast` tree, uri, and per-document caches.
+- AST/Offsets: `std.zig.Ast` plus utilities from `offsets.zig` and `ast.zig` to traverse and map text↔positions.
+- Analysis: `analysis.zig` contains semantic primitives (declarations, visibility, types).
+- Document Symbols: `features/document_symbol.zig` builds hierarchical `types.DocumentSymbol` from the AST.
+
+Initialize a Server and Open a Document
+- Create server: `const server = try zls.Server.create(.{ .allocator = arena, .transport = null, .config = null, .config_manager = zls.configuration.Manager.init(arena) });`
+- Initialize: send `initialize`/`initialized` (see `initServer` in `src/tools/hover_cli.zig`).
+- Open a file: construct `uri` from path via `zls.URI.fromPath`, then notify `textDocument/didOpen` using `types.DidOpenTextDocumentParams`.
+- Get the handle: `server.document_store.getHandle(uri).?` → `*zls.DocumentStore.Handle`.
+
+Get Hierarchical Document Symbols
+- Use the internal builder directly (no LSP):
+  - `const syms = try zls.document_symbol.getDocumentSymbols(alloc, handle.tree, server.offset_encoding);`
+- Returns: `[]types.DocumentSymbol` with:
+  - `name`, `detail` (signature for functions), `kind` (Function, Struct, Enum, Field, EnumMember, Constant, Variable, etc.)
+  - `range`, `selectionRange` (LSP-style positions),
+  - `children` (nested symbols for containers and functions)
+- This already gives a perfect, hierarchical symbol tree. Iterate `symbol.children` recursively to display containers with their fields/methods and enums with members.
+- Reference: `src/features/document_symbol.zig` (fn `getDocumentSymbols`).
+
+Collect Imports (per file)
+- `var imports = try zls.Analyser.collectImports(alloc, handle.tree);`
+- Produces list of import paths discovered in the AST.
+- Used by the CLI: see `analyzeSymbolsWithZLS` in `src/tools/hover_cli.zig`.
+
+Visibility and Declarations via Semantic Analysis
+- Most rich queries hinge on `analysis.DeclWithHandle`, which wraps a declaration with its document handle and optional container type context.
+- Building declaration lists:
+  - From a container type: `analysis.collectDeclarationsOfContainer(analyser, container_type, original_handle, instance_access, &decls)`
+    - Includes fields, methods, nested declarations. Respects visibility when crossing files: it skips non-public members if `handle != original_handle`.
+  - At a position: `analysis.collectAllSymbolsAtSourceIndex(analyser, handle, source_index, &decls)` to gather symbols visible at a given byte index.
+- Inspecting a declaration:
+  - `decl.isPublic()` → true for `pub` items or container fields.
+  - `decl.isConst()` → const vs var.
+  - `decl.definitionToken(analyser, resolve_alias)` → token/handle of the canonical definition (follows aliases and types when requested).
+  - `decl.typeDeclarationNode()` → AST node where type is written (if any).
+  - `decl.resolveType(analyser)` → `?analysis.Type` of the declaration (follows aliases, generics, capture-by-ref handling).
+  - `decl.docComments(alloc)` → optional collected doc comment text.
+- References: `src/analysis.zig` (struct `DeclWithHandle` and helpers near `isPublic`, `docComments`, `resolveType`).
+
+Getting a Container Type and Its Members
+- Turn a declaration (or a position) into a container type:
+  - From context (position): `analysis.innermostContainer(analyser, handle, source_index)` → `Type` representing the container enclosing that location.
+  - From a specific decl: `try decl.resolveType(analyser)`; if its `Type.data` is `.container`, you can enumerate members.
+- Enumerate container members:
+  - Call `analysis.collectDeclarationsOfContainer(analyser, container_type, original_handle, instance_access, &decls)`.
+    - For `instance_access = true`, only methods whose first parameter is the container type are included (i.e. instance methods). For `false`, include static functions and fields as appropriate.
+  - Each collected element is a `DeclWithHandle`, so you can call `isPublic`, `resolveType`, `docComments`, etc.
+
+Function Signatures and Pretty Details
+- For functions, `document_symbol` populates `symbol.detail` with a rendered signature using `analysis.getFunctionSignature(tree, fn_info)`.
+- If you have a `DeclWithHandle` for a function and want to render its signature yourself, see the helper in `src/analysis.zig` and `src/ast.zig` to reconstruct or print the prototype.
+
+Mapping Positions, Tokens, and Nodes
+- Conversions live in `src/offsets.zig`:
+  - Tokens/nodes → ranges/positions: `tokenToRange`, `nodeToRange`, `tokenToLoc`, `nodeToLoc`.
+  - Text index ↔ position: `tokenPositionToRange`, `indexToPosition`, `multiple.indexToPositionWithMappings`.
+- From symbol to token:
+  - Use `symbol.selectionRange.start` (LSP position). If you need the AST token index at that point, convert via `offsets.tokenPositionToLoc` or match against `analysis`-reported tokens.
+- Document scopes: `handle.getDocumentScope()` returns `DocumentScope` used internally by analysis to index declarations, scopes, and nodes.
+
+Doc Comments
+- With a `DeclWithHandle` in hand, `decl.docComments(alloc)` collects concatenated doc comments for that declaration and returns an optional slice.
+
+Minimal End-to-End Patterns
+- Build a symbols tree for a file:
+  1) Open file → get `handle`.
+  2) `const syms = try zls.document_symbol.getDocumentSymbols(alloc, handle.tree, server.offset_encoding);`
+  3) Recursively print `syms`, grouping by `symbol.kind` and walking `symbol.children`.
+
+- For each container symbol, enumerate semantic members with visibility:
+  1) Construct an `analysis.Analyser` (see how `Server` owns it) or reuse `server.analyser` if available from your context.
+  2) Resolve the `Type` of the container (from a `DeclWithHandle` pointing at the container, or using `analysis.innermostContainer`).
+  3) `analysis.collectDeclarationsOfContainer(analyser, container_ty, handle, instance_access, &decls)`.
+  4) For each `DeclWithHandle` in `decls`: `isPublic()`, `resolveType()`, `docComments()`, and print accordingly.
+
+- Check visibility of a symbol:
+  - If you already have a `DeclWithHandle`, just call `isPublic()`.
+  - If you only have a `types.DocumentSymbol`, locate its declaration by walking `DocumentScope` declarations within `symbol.selectionRange` and building a `DeclWithHandle` to query.
+
+- Collect imports of a file:
+  - `var imports = try zls.Analyser.collectImports(alloc, handle.tree);` then iterate `imports.items`.
+
+Where to Look in the Codebase
+- Symbols builder: `src/features/document_symbol.zig`
+- Semantic primitives: `src/analysis.zig` (DeclWithHandle, Type, collectors, visibility)
+- Document store and scopes: `src/DocumentStore.zig` and `src/DocumentScope.zig`
+- Offsets/position utilities: `src/offsets.zig`
+- CLI examples: `src/tools/hover_cli.zig` (init server, open docs, use `getDocumentSymbols`, print structures)
+
+Worked Example Flow (mirrors hover CLI)
+- Setup: create `Server`, send `initialize/initialized`.
+- Open `.zig` file and obtain `handle`.
+- Optionally collect `imports`.
+- Build `[]types.DocumentSymbol` via `getDocumentSymbols(...)`.
+- For each top-level symbol:
+  - If it’s a container (`.Struct/.Enum/.Namespace` or a `.Constant` with children), print `symbol.name` and walk its `children` split into Fields, Methods, EnumMembers.
+  - If it’s a `.Function`, use `symbol.detail` for the signature.
+- If you need authoritative visibility/type/docs, resolve to `DeclWithHandle` and use `analysis` APIs (avoid name/heuristic logic).
+
+Cautions and Best Practices
+- Do not reimplement AST walking: rely on `document_symbol.getDocumentSymbols` for hierarchical structure.
+- Do not infer visibility from names: use `DeclWithHandle.isPublic()`.
+- Prefer `analysis.collectDeclarationsOfContainer` over manual child categorization to respect instance/static and enum nuances.
+- Use `offsets.zig` for all text↔position conversions to keep encoding consistent with the server’s `offset_encoding`.
+
+Quick Reference: Frequently Used APIs
+- `zls.document_symbol.getDocumentSymbols(alloc, handle.tree, server.offset_encoding)` → `[]types.DocumentSymbol`
+- `zls.Analyser.collectImports(alloc, handle.tree)` → list of imports
+- `DeclWithHandle.isPublic()`, `.docComments(alloc)`, `.resolveType(analyser)`, `.definitionToken(analyser, resolve_alias)`
+- `analysis.collectDeclarationsOfContainer(analyser, container_ty, handle, instance_access, &decls)`
+- `analysis.collectAllSymbolsAtSourceIndex(analyser, handle, source_index, &decls)`
+- `handle.getDocumentScope()` → scope table for declarations
+- `offsets.nodeToRange`, `offsets.tokenToRange`, `offsets.multiple.indexToPositionWithMappings`
+
+See also the live example output from running:
+- `./zig-out/bin/hover symbols src --api --minimal --locations`
+  This uses the exact internal paths above and prints types, fields, methods, and function signatures using ZLS internal analysis.
+

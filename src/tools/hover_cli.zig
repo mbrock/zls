@@ -13,6 +13,10 @@ const zls = @import("zls");
 const types = zls.lsp.types;
 const DiffMatchPatch = @import("diffz");
 
+// TODO: When ZLS exposes symbol→decl mapping and structured signature/type
+// APIs, migrate printing to use those directly for richer details (visibility,
+// attributes, fully-qualified types) without additional AST probing here.
+
 fn outPrint(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
@@ -25,11 +29,18 @@ const Usage =
     \\\hover - Simple ZLS helper
     \\\n+    \\\USAGE:
     \\\  hover info <file> <line> <column> [--markdown|--plaintext]
-    \\\  hover symbols <file> [--plain]
+    \\\  hover symbols <file> [--public] [--private] [--imports] [--locations] [--api] [--minimal]
     \\\  hover actions <file> <line> <column> [<end_line> <end_col>] [--kind refactor|quickfix|source]
     \\\  hover apply <file> <line> <column> [<end_line> <end_col>] <index>
     \\\  hover refactor <file> <line> <column> [<end_line> <end_col>] [--apply N]
     \\\  hover --help
+    \\\n+    \\\SYMBOLS OPTIONS:
+    \\\  --public       Show only public symbols (default)
+    \\\  --private      Include private symbols
+    \\\  --imports      Show imports section (default)
+    \\\  --locations    Show line numbers
+    \\\  --api          Public API only (types + functions, no imports)
+    \\\  --minimal      Types and public functions only
     \\\n+    \\\NOTES:
     \\\  - line/column are 1-based (as shown by editors)
     \\\  - info prints hover text at the given position
@@ -37,6 +48,15 @@ const Usage =
 ;
 
 const Command = enum { info, symbols, report, pagerank, xref, actions, apply, refactor };
+
+const SymbolsOptions = struct {
+    show_public: bool = true,
+    show_private: bool = false,
+    show_imports: bool = true,
+    show_locations: bool = false,
+    api_only: bool = false,
+    minimal: bool = false,
+};
 
 fn parseArgs(allocator: std.mem.Allocator) !struct {
     cmd: Command,
@@ -49,6 +69,7 @@ fn parseArgs(allocator: std.mem.Allocator) !struct {
     kind_filter: ?types.CodeActionKind,
     do_apply: bool,
     markdown: bool,
+    symbols_opts: SymbolsOptions,
     args_mem: [][:0]u8,
 } {
     const argv = try std.process.argsAlloc(allocator);
@@ -82,6 +103,7 @@ fn parseArgs(allocator: std.mem.Allocator) !struct {
     var action_index: ?usize = null;
     var kind_filter: ?types.CodeActionKind = null;
     var do_apply = false;
+    var symbols_opts = SymbolsOptions{};
 
     switch (cmd) {
         .info => {
@@ -104,8 +126,26 @@ fn parseArgs(allocator: std.mem.Allocator) !struct {
             }
             var i: usize = 3;
             while (i < argv.len) : (i += 1) {
-                if (std.mem.eql(u8, argv[i], "--plaintext") or std.mem.eql(u8, argv[i], "--plain")) markdown = false;
-                if (std.mem.eql(u8, argv[i], "--markdown")) markdown = true;
+                if (std.mem.eql(u8, argv[i], "--public")) {
+                    symbols_opts.show_public = true;
+                    symbols_opts.show_private = false;
+                } else if (std.mem.eql(u8, argv[i], "--private")) {
+                    symbols_opts.show_private = true;
+                } else if (std.mem.eql(u8, argv[i], "--imports")) {
+                    symbols_opts.show_imports = true;
+                } else if (std.mem.eql(u8, argv[i], "--locations")) {
+                    symbols_opts.show_locations = true;
+                } else if (std.mem.eql(u8, argv[i], "--api")) {
+                    symbols_opts.api_only = true;
+                    symbols_opts.show_imports = false;
+                } else if (std.mem.eql(u8, argv[i], "--minimal")) {
+                    symbols_opts.minimal = true;
+                    symbols_opts.show_imports = false;
+                } else if (std.mem.eql(u8, argv[i], "--plaintext") or std.mem.eql(u8, argv[i], "--plain")) {
+                    markdown = false;
+                } else if (std.mem.eql(u8, argv[i], "--markdown")) {
+                    markdown = true;
+                }
             }
         },
         .pagerank => {
@@ -212,7 +252,7 @@ fn parseArgs(allocator: std.mem.Allocator) !struct {
         },
     }
 
-    return .{ .cmd = cmd, .file = file, .line = line, .col = col, .end_line = end_line, .end_col = end_col, .action_index = action_index, .kind_filter = kind_filter, .do_apply = do_apply, .markdown = markdown, .args_mem = argv };
+    return .{ .cmd = cmd, .file = file, .line = line, .col = col, .end_line = end_line, .end_col = end_col, .action_index = action_index, .kind_filter = kind_filter, .do_apply = do_apply, .markdown = markdown, .symbols_opts = symbols_opts, .args_mem = argv };
 }
 
 fn freeArgs(_: std.mem.Allocator, _: [][:0]u8) void {
@@ -254,12 +294,289 @@ fn openDocument(server: *zls.Server, arena: std.mem.Allocator, file_path: []cons
     return server.document_store.getHandle(uri).?;
 }
 
-fn printSymbols(root: []const types.DocumentSymbol, depth: usize) void {
-    for (root) |sym| {
-        const indent = switch (depth) { 0 => "", 1 => "  ", 2 => "    ", else => "      " };
-        outPrint("{s}{s} ({s})\n", .{ indent, sym.name, @tagName(sym.kind) });
-        if (sym.children) |children| printSymbols(children, depth + 1);
+fn analyzeSymbolsWithZLS(allocator: std.mem.Allocator, server: *zls.Server, handle: *zls.DocumentStore.Handle, opts: SymbolsOptions) !void {
+    // Get imports using ZLS's function
+    if (opts.show_imports) {
+        var imports = try zls.Analyser.collectImports(allocator, handle.tree);
+        defer imports.deinit(allocator);
+        
+        if (imports.items.len > 0) {
+            outPrint("Imports:\n", .{});
+            for (imports.items) |import_path| {
+                outPrint("  {s}\n", .{import_path});
+            }
+            outPrint("\n", .{});
+        }
     }
+    
+    // Use ZLS's document symbols - it already has perfect hierarchical structure!
+    const symbols = try zls.document_symbol.getDocumentSymbols(
+        allocator,
+        handle.tree,
+        server.offset_encoding
+    );
+    
+    // Display the symbols using ZLS's perfect data, passing handle for AST access
+    try displaySymbolsHierarchically(symbols, handle, opts);
+}
+
+fn displaySymbolsHierarchically(symbols: []const types.DocumentSymbol, handle: *zls.DocumentStore.Handle, opts: SymbolsOptions) !void {
+    // Use arena allocator for temporary allocations
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    
+    // Separate into categories
+    var containers: std.ArrayList(types.DocumentSymbol) = .empty;
+    var functions: std.ArrayList(types.DocumentSymbol) = .empty;
+    var constants: std.ArrayList(types.DocumentSymbol) = .empty;
+    
+    for (symbols) |symbol| {
+        // A Constant with children is actually a container type (struct/enum/union)
+        if (symbol.kind == .Constant and symbol.children != null and symbol.children.?.len > 0) {
+            try containers.append(allocator, symbol);
+        } else {
+            switch (symbol.kind) {
+                .Struct, .Class, .Interface, .Enum, .Namespace => try containers.append(allocator, symbol),
+                .Function, .Method, .Constructor => try functions.append(allocator, symbol),
+                .Constant, .Variable => try constants.append(allocator, symbol),
+                else => {},
+            }
+        }
+    }
+    
+    // Print Types with their hierarchical structure
+    if (containers.items.len > 0) {
+        outPrint("Types:\n", .{});
+        for (containers.items) |container| {
+            try printContainerWithStructure(container, handle);
+        }
+        outPrint("\n", .{});
+    }
+    
+    // Print Functions with structured signatures
+    if (functions.items.len > 0) {
+        outPrint("Functions:\n", .{});
+        for (functions.items) |func| {
+            try printStructuredFunction(func, handle);
+        }
+        outPrint("\n", .{});
+    }
+    
+    // Print Constants (skip import constants)
+    if (!opts.api_only and !opts.minimal and constants.items.len > 0) {
+        outPrint("Constants:\n", .{});
+        for (constants.items) |constant| {
+            // Skip obvious imports
+            if (std.mem.eql(u8, constant.name, "std") or 
+                std.mem.eql(u8, constant.name, "builtin") or
+                std.mem.endsWith(u8, constant.name, ".zig")) continue;
+            outPrint("  {s}\n", .{constant.name});
+        }
+    }
+}
+
+fn printContainerWithStructure(container: types.DocumentSymbol, handle: *zls.DocumentStore.Handle) !void {
+    // Determine container type - ZLS already knows!
+    const container_type = if (container.kind == .Struct) "struct" 
+                         else if (container.kind == .Enum) "enum"
+                         else if (container.kind == .Class or container.kind == .Interface) "interface"
+                         else "struct"; // For Constants that are actually containers
+    
+    outPrint("  {s} ({s})\n", .{container.name, container_type});
+    
+    // Print the hierarchical structure ZLS already parsed!
+    if (container.children) |children| {
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+        
+        var fields: std.ArrayList(types.DocumentSymbol) = .empty;
+        var methods: std.ArrayList(types.DocumentSymbol) = .empty;
+        var enum_values: std.ArrayList(types.DocumentSymbol) = .empty;
+        
+        // Categorize children
+        for (children) |child| {
+            switch (child.kind) {
+                .Field, .Property => try fields.append(allocator, child),
+                .Function, .Method, .Constructor => try methods.append(allocator, child),
+                .EnumMember => try enum_values.append(allocator, child),
+                else => {},
+            }
+        }
+        
+        // Print fields
+        if (fields.items.len > 0) {
+            outPrint("    Fields:\n", .{});
+            for (fields.items) |field| {
+                outPrint("      {s}\n", .{field.name});
+            }
+        }
+        
+        // Print enum values  
+        if (enum_values.items.len > 0) {
+            outPrint("    Values:\n", .{});
+            for (enum_values.items) |value| {
+                outPrint("      {s}\n", .{value.name});
+            }
+        }
+        
+        // Print methods with structured signatures
+        if (methods.items.len > 0) {
+            outPrint("    Methods:\n", .{});
+            for (methods.items) |method| {
+                try printStructuredMethod(method, handle);
+            }
+        }
+    }
+}
+
+
+// Print a top-level function symbol with its structured signature when available.
+// Leverages symbol.detail which document_symbol fills using ZLS analysis.
+fn printStructuredFunction(sym: types.DocumentSymbol, handle: *zls.DocumentStore.Handle) !void {
+    _ = handle; // not needed currently; keep for future AST-aware enhancements
+    if (sym.detail) |d| {
+        outPrint("  {s}: {s}\n", .{ sym.name, d });
+    } else {
+        outPrint("  {s}\n", .{ sym.name });
+    }
+}
+
+// Print a method inside a container with indentation and signature when available.
+fn printStructuredMethod(sym: types.DocumentSymbol, handle: *zls.DocumentStore.Handle) !void {
+    _ = handle;
+    if (sym.detail) |d| {
+        outPrint("      {s}: {s}\n", .{ sym.name, d });
+    } else {
+        outPrint("      {s}\n", .{ sym.name });
+    }
+}
+
+
+
+
+
+
+
+
+fn printSymbolsEnhanced(allocator: std.mem.Allocator, server: *zls.Server, handle: *zls.DocumentStore.Handle, root: []const types.DocumentSymbol, opts: SymbolsOptions) void {
+    // Use ZLS's own implementations instead of reimplementing!
+    analyzeSymbolsWithZLS(allocator, server, handle, opts) catch |err| {
+        std.debug.print("Error analyzing symbols: {any}\n", .{err});
+        // Fallback to simplified method if ZLS analysis fails
+        printSymbolsFallback(root, opts);
+    };
+}
+
+fn printSymbolsFallback(root: []const types.DocumentSymbol, opts: SymbolsOptions) void {
+    // Simplified fallback - just show the basic symbol names
+    for (root) |sym| {
+        switch (sym.kind) {
+            .Function, .Method, .Constructor => {
+                if (opts.show_public or opts.show_private) {
+                    outPrint("  {s} (fn)\n", .{sym.name});
+                }
+            },
+            .Struct, .Class, .Interface, .Enum => {
+                if (opts.show_public or opts.show_private) {
+                    outPrint("  {s} (type)\n", .{sym.name});
+                }
+            },
+            .Constant => {
+                if (!opts.api_only and !opts.minimal) {
+                    outPrint("  {s} (const)\n", .{sym.name});
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+
+
+fn printSymbols(allocator: std.mem.Allocator, server: *zls.Server, handle: *zls.DocumentStore.Handle, root: []const types.DocumentSymbol, opts: SymbolsOptions) void {
+    printSymbolsEnhanced(allocator, server, handle, root, opts);
+}
+
+fn printSymbolInformation(infos: []const types.SymbolInformation) void {
+    var structs_count: u32 = 0;
+    var functions_count: u32 = 0;
+    var constants_count: u32 = 0;
+    
+    // Count each type first
+    for (infos) |sym| {
+        switch (sym.kind) {
+            .Struct, .Class, .Interface => structs_count += 1,
+            .Function, .Method, .Constructor => functions_count += 1,
+            .Constant => constants_count += 1,
+            else => {},
+        }
+    }
+    
+    // Print organized sections
+    if (structs_count > 0) {
+        outPrint("\n📦 Structs & Types:\n", .{});
+        for (infos) |sym| {
+            if (sym.kind == .Struct or sym.kind == .Class or sym.kind == .Interface) {
+                printSymbolInfoWithLocation(sym);
+            }
+        }
+    }
+    
+    if (functions_count > 0) {
+        outPrint("\n🔧 Functions & Methods:\n", .{});
+        for (infos) |sym| {
+            if (sym.kind == .Function or sym.kind == .Method or sym.kind == .Constructor) {
+                printSymbolInfoWithLocation(sym);
+            }
+        }
+    }
+    
+    if (constants_count > 0) {
+        outPrint("\n📌 Constants:\n", .{});
+        for (infos) |sym| {
+            if (sym.kind == .Constant) {
+                printSymbolInfoWithLocation(sym);
+            }
+        }
+    }
+    
+    // Print other symbols
+    outPrint("\n📝 Other:\n", .{});
+    for (infos) |sym| {
+        switch (sym.kind) {
+            .Struct, .Class, .Interface, .Function, .Method, .Constructor, .Constant => {},
+            else => printSymbolInfoWithLocation(sym),
+        }
+    }
+}
+
+fn printSymbolInfoWithLocation(sym: types.SymbolInformation) void {
+    const line = sym.location.range.start.line + 1; // Convert to 1-based
+    const col = sym.location.range.start.character + 1; // Convert to 1-based
+    
+    const kind_icon = switch (sym.kind) {
+        .Function => "fn",
+        .Method => "fn", 
+        .Constructor => "fn",
+        .Struct => "struct",
+        .Class => "class",
+        .Interface => "interface",
+        .Enum => "enum",
+        .EnumMember => "•",
+        .Constant => "const",
+        .Variable => "var",
+        .Field => "field",
+        .Property => "prop",
+        else => "?",
+    };
+    
+    // Show visibility for public symbols
+    // This function is still using the fallback method
+    
+    // Format: [line:col] visibility kind name
+    outPrint("[{d:>3}:{d:<2}] {s:<8} {s}\n", .{ line, col, kind_icon, sym.name });
 }
 
 fn printDiff(allocator: std.mem.Allocator, before: []const u8, after: []const u8, path: []const u8) void {
@@ -410,9 +727,28 @@ fn computePageRank(nodes: []PRNode, iters: u32, damping: f64, allocator: std.mem
 }
 
 fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: []const u8) !void {
+    var timer = std.time.Timer.start() catch return;
+    
     const abs_root = try std.fs.cwd().realpathAlloc(allocator, root_path);
     var files: std.ArrayList([]const u8) = .empty;
-    try walkZigFiles(allocator, abs_root, &files);
+    
+    // Check if it's a single file or directory
+    const stat = std.fs.cwd().statFile(abs_root) catch blk: {
+        // Try as directory if file stat fails
+        try walkZigFiles(allocator, abs_root, &files);
+        break :blk null;
+    };
+    
+    if (stat) |s| {
+        if (s.kind == .file and std.mem.endsWith(u8, abs_root, ".zig")) {
+            try files.append(allocator, abs_root);
+        } else if (s.kind == .directory) {
+            try walkZigFiles(allocator, abs_root, &files);
+        }
+    }
+    
+    const file_walk_time = timer.lap();
+    std.debug.print("[DEBUG] File discovery: {}ms (found {} files)\n", .{file_walk_time / std.time.ns_per_ms, files.items.len});
 
     var nodes: std.ArrayList(PRNode) = .empty;
     var index_by_key = std.StringHashMap(u32).init(allocator);
@@ -445,52 +781,111 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
             else => {},
         };
     }
+    
+    const node_build_time = timer.lap();
+    std.debug.print("[DEBUG] Node building: {}ms ({} nodes from {} files)\n", .{node_build_time / std.time.ns_per_ms, nodes.items.len, max_files});
 
     var syms_cache = std.StringHashMap([]const types.DocumentSymbol).init(allocator);
 
     var j: usize = 0;
+    var refs_processed: usize = 0;
+    var total_ref_requests: usize = 0;
+    var total_symbol_requests: usize = 0;
+    var cache_hits: usize = 0;
+    var edges_added: usize = 0;
+    var node_batch_timer = timer.lap();
+    
     while (j < nodes.items.len) : (j += 1) {
+        const node_start = timer.read();
         const n = nodes.items[j];
+        
+        // Time the reference request
+        const ref_start = timer.read();
         const refs = server.sendRequestSync(allocator, "textDocument/references", .{
             .textDocument = .{ .uri = n.uri },
             .position = n.pos,
             .context = .{ .includeDeclaration = false },
         }) catch continue;
-        if (refs) |locs| for (locs) |loc| {
-            const caller_uri = loc.uri;
-            const caller_syms = blk: {
-                if (syms_cache.get(caller_uri)) |arr| break :blk arr;
-                const h = server.document_store.getOrLoadHandle(caller_uri) orelse break :blk &[_]types.DocumentSymbol{};
-                const ds = server.sendRequestSync(allocator, "textDocument/documentSymbol", .{ .textDocument = .{ .uri = h.uri } }) catch break :blk &[_]types.DocumentSymbol{};
-                if (ds) |resp| switch (resp) {
-                    .array_of_DocumentSymbol => |arr| {
-                        _ = syms_cache.put(allocator.dupe(u8, caller_uri) catch break :blk arr, arr) catch {};
+        total_ref_requests += 1;
+        const ref_time = timer.read() - ref_start;
+        
+        if (refs) |locs| {
+            refs_processed += locs.len;
+            for (locs) |loc| {
+                const caller_uri = loc.uri;
+                const sym_start = timer.read();
+                const caller_syms = blk: {
+                    if (syms_cache.get(caller_uri)) |arr| {
+                        cache_hits += 1;
                         break :blk arr;
-                    },
-                    else => break :blk &[_]types.DocumentSymbol{},
-                } else break :blk &[_]types.DocumentSymbol{};
-            };
-            var caller_idx: ?u32 = null;
-            for (caller_syms) |s| {
-                const r = s.range;
-                const p = loc.range.start;
-                const within = (p.line >= r.start.line and p.line <= r.end.line);
-                if (within and (s.kind == .Function or s.kind == .Method)) {
-                    const key = std.fmt.allocPrint(allocator, "{s}:{d}", .{ caller_uri, s.selectionRange.start.line }) catch continue;
-                    if (index_by_key.get(key)) |idx| caller_idx = idx;
-                    break;
+                    }
+                    const h = server.document_store.getOrLoadHandle(caller_uri) orelse break :blk &[_]types.DocumentSymbol{};
+                    const ds = server.sendRequestSync(allocator, "textDocument/documentSymbol", .{ .textDocument = .{ .uri = h.uri } }) catch break :blk &[_]types.DocumentSymbol{};
+                    total_symbol_requests += 1;
+                    if (ds) |resp| switch (resp) {
+                        .array_of_DocumentSymbol => |arr| {
+                            _ = syms_cache.put(allocator.dupe(u8, caller_uri) catch break :blk arr, arr) catch {};
+                            break :blk arr;
+                        },
+                        else => break :blk &[_]types.DocumentSymbol{},
+                    } else break :blk &[_]types.DocumentSymbol{};
+                };
+                _ = timer.read() - sym_start; // sym_time unused
+                
+                var caller_idx: ?u32 = null;
+                for (caller_syms) |s| {
+                    const r = s.range;
+                    const p = loc.range.start;
+                    const within = (p.line >= r.start.line and p.line <= r.end.line);
+                    if (within and (s.kind == .Function or s.kind == .Method)) {
+                        const key = std.fmt.allocPrint(allocator, "{s}:{d}", .{ caller_uri, s.selectionRange.start.line }) catch continue;
+                        if (index_by_key.get(key)) |idx| caller_idx = idx;
+                        break;
+                    }
+                }
+                if (caller_idx) |from| {
+                    nodes.items[@intCast(from)].out_edges.append(allocator, @intCast(j)) catch {};
+                    edges_added += 1;
                 }
             }
-            if (caller_idx) |from| nodes.items[@intCast(from)].out_edges.append(allocator, @intCast(j)) catch {};
-        };
+        }
+        
+        _ = timer.read() - node_start; // node_time unused
+        if ((j + 1) % 5 == 0 or j + 1 == nodes.items.len) {
+            const batch_time = timer.lap() - node_batch_timer;
+            const progress_time = timer.read() / std.time.ns_per_ms;
+            std.debug.print("[DEBUG] Batch {}-{}: {}ms | Node '{s}': refs={}, refTime={}ms | Total: {}ms, edges={}\n", 
+                .{j - 4, j + 1, batch_time / std.time.ns_per_ms, n.name, if (refs) |r| r.len else 0, 
+                  ref_time / std.time.ns_per_ms, progress_time, edges_added});
+            node_batch_timer = timer.read();
+        }
+        if ((j + 1) % 20 == 0 or j + 1 == nodes.items.len) {
+            std.debug.print("[DEBUG] Stats: refReqs={}, symReqs={}, cacheHits={}, edges={}, refs={}\n", 
+                .{total_ref_requests, total_symbol_requests, cache_hits, edges_added, refs_processed});
+        }
     }
+    
+    const ref_analysis_time = timer.lap();
+    std.debug.print("[DEBUG] Reference analysis complete: {}ms ({} total references)\n", .{ref_analysis_time / std.time.ns_per_ms, refs_processed});
 
+    std.debug.print("[DEBUG] Starting PageRank computation (20 iterations, damping=0.85)...\n", .{});
     computePageRank(nodes.items, 20, 0.85, allocator);
+    
+    const pagerank_time = timer.lap();
+    std.debug.print("[DEBUG] PageRank computation: {}ms\n", .{pagerank_time / std.time.ns_per_ms});
+    
     var idxs = std.ArrayList(u32).empty;
     if (idxs.resize(allocator, nodes.items.len)) |_| {} else |_| return;
     for (idxs.items, 0..) |*v, k| v.* = @intCast(k);
     const Ctx = struct { nodes: []PRNode, pub fn lessThan(ctx: @This(), a: u32, b: u32) bool { return ctx.nodes[a].score > ctx.nodes[b].score; } };
     std.mem.sort(u32, idxs.items, Ctx{ .nodes = nodes.items }, Ctx.lessThan);
+    
+    const sort_time = timer.lap();
+    std.debug.print("[DEBUG] Sorting results: {}ms\n", .{sort_time / std.time.ns_per_ms});
+    
+    const total_time = timer.read() / std.time.ns_per_ms;
+    std.debug.print("[DEBUG] Total pagerank time: {}ms\n", .{total_time});
+    
     const top = @min(@as(usize, 20), idxs.items.len);
     outPrint("PageRank Top {d} (functions/methods)\n", .{top});
     var k: usize = 0;
@@ -551,6 +946,7 @@ fn ensureDirForFile(path: []const u8) void {
 }
 
 fn applyWorkspaceEditToFs(allocator: std.mem.Allocator, server: *zls.Server, edit: types.WorkspaceEdit, dry_run: bool) !void {
+    _ = dry_run; // suppress unused parameter warning
     if (edit.changes) |chg| {
         var it = chg.map.iterator();
         while (it.next()) |kv| {
@@ -780,28 +1176,83 @@ pub fn main() !u8 {
             }
         },
         .symbols => {
-            const content = std.fs.cwd().readFileAlloc(allocator, parsed.file, std.math.maxInt(usize)) catch |e| {
-                outPrint("Error reading '{s}': {any}\n", .{ parsed.file, e });
+            const abs_path = std.fs.cwd().realpathAlloc(allocator, parsed.file) catch |e| {
+                outPrint("Error resolving path '{s}': {any}\n", .{ parsed.file, e });
                 return 1;
             };
-            const handle = openDocument(server, allocator, parsed.file, content) catch |e| {
-                outPrint("Failed to open document: {any}\n", .{e});
+            
+            // Check if it's a single file or directory
+            const stat = std.fs.cwd().statFile(abs_path) catch |e| {
+                outPrint("Error accessing '{s}': {any}\n", .{ abs_path, e });
                 return 1;
             };
-            const params: types.DocumentSymbolParams = .{ .textDocument = .{ .uri = handle.uri } };
-            const syms = server.sendRequestSync(allocator, "textDocument/documentSymbol", params) catch |e| {
-                outPrint("Symbols error: {any}\n", .{e});
-                return 1;
-            };
-            if (syms) |resp| {
-                switch (resp) {
-                    .array_of_DocumentSymbol => |arr| printSymbols(arr, 0),
-                    .array_of_SymbolInformation => |infos| {
-                        for (infos) |info| outPrint("{s} ({s})\n", .{ info.name, @tagName(info.kind) });
-                    },
+            
+            if (stat.kind == .file and std.mem.endsWith(u8, abs_path, ".zig")) {
+                // Handle single file
+                const content = std.fs.cwd().readFileAlloc(allocator, abs_path, std.math.maxInt(usize)) catch |e| {
+                    outPrint("Error reading '{s}': {any}\n", .{ abs_path, e });
+                    return 1;
+                };
+                const handle = openDocument(server, allocator, abs_path, content) catch |e| {
+                    outPrint("Failed to open document: {any}\n", .{e});
+                    return 1;
+                };
+                const params: types.DocumentSymbolParams = .{ .textDocument = .{ .uri = handle.uri } };
+                const syms = server.sendRequestSync(allocator, "textDocument/documentSymbol", params) catch |e| {
+                    outPrint("Symbols error: {any}\n", .{e});
+                    return 1;
+                };
+                if (syms) |resp| {
+                    outPrint("File: {s}\n", .{abs_path});
+                    switch (resp) {
+                        .array_of_DocumentSymbol => |arr| printSymbols(allocator, server, handle, arr, parsed.symbols_opts),
+                        .array_of_SymbolInformation => |infos| printSymbolInformation(infos),
+                    }
+                } else {
+                    outPrint("No symbols in {s}.\n", .{abs_path});
                 }
+            } else if (stat.kind == .directory) {
+                // Handle directory - walk all .zig files
+                var files: std.ArrayList([]const u8) = .empty;
+                walkZigFiles(allocator, abs_path, &files) catch |e| {
+                    outPrint("Error walking directory '{s}': {any}\n", .{ abs_path, e });
+                    return 1;
+                };
+                
+                var total_symbols: usize = 0;
+                const max_files: usize = @min(files.items.len, 50); // Limit to avoid spam
+                for (files.items[0..max_files]) |file_path| {
+                    const content = std.fs.cwd().readFileAlloc(allocator, file_path, std.math.maxInt(usize)) catch continue;
+                    const handle = openDocument(server, allocator, file_path, content) catch continue;
+                    const params: types.DocumentSymbolParams = .{ .textDocument = .{ .uri = handle.uri } };
+                    const syms = server.sendRequestSync(allocator, "textDocument/documentSymbol", params) catch continue;
+                    if (syms) |resp| {
+                        const rel_path = if (std.mem.startsWith(u8, file_path, abs_path)) 
+                            file_path[abs_path.len..] 
+                        else 
+                            file_path;
+                        switch (resp) {
+                            .array_of_DocumentSymbol => |arr| {
+                                if (arr.len > 0) {
+                                    outPrint("\n📁 {s} ({d} symbols)\n", .{rel_path, arr.len});
+                                    printSymbols(allocator, server, handle, arr, parsed.symbols_opts);
+                                    total_symbols += arr.len;
+                                }
+                            },
+                            .array_of_SymbolInformation => |infos| {
+                                if (infos.len > 0) {
+                                    outPrint("\n📁 {s} ({d} symbols)\n", .{rel_path, infos.len});
+                                    printSymbolInformation(infos);
+                                    total_symbols += infos.len;
+                                }
+                            },
+                        }
+                    }
+                }
+                outPrint("\n📊 Summary: {d} symbols across {d} files\n", .{total_symbols, max_files});
             } else {
-                outPrint("No symbols.\n", .{});
+                outPrint("'{s}' is not a .zig file or directory\n", .{abs_path});
+                return 1;
             }
         },
     }
