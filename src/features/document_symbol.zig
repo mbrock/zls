@@ -9,6 +9,12 @@ const ast = @import("../ast.zig");
 const analysis = @import("../analysis.zig");
 const tracy = @import("tracy");
 
+// TODO(hover-cli API): Extend symbol building options and bridging:
+// - getDocumentSymbolsEx(opts): allow filtering (public_only, include_fields,
+//   include_tests, flatten vs nested) to reduce post-processing in tools.
+// - symbolToDecl(handle, symbol): map DocumentSymbol.selectionRange to
+//   DeclWithHandle for visibility/docs/type queries without heuristics.
+
 const Symbol = struct {
     name: []const u8,
     detail: ?[]const u8 = null,

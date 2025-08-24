@@ -19,6 +19,16 @@ const tracy = @import("tracy");
 const InternPool = @import("analyser/InternPool.zig");
 const references = @import("features/references.zig");
 
+// TODO(hover-cli API): Consider exposing small convenience primitives to
+// make external tools (like src/tools/hover_cli.zig) simpler without
+// duplicating analysis logic:
+// - DeclId: stable identifier + declFromId/declId helpers
+// - rangeToDecl/symbolToDecl: map ranges/symbols to DeclWithHandle
+// - SignatureInfo: structured function signature (besides pretty strings)
+// - listContainerMembers: filtered wrapper over collectDeclarationsOfContainer
+// - typeToString: configurable pretty-printer for analysis.Type
+// - findOutgoingCalls/findIncomingCalls: lightweight call/ref graph hooks
+
 pub const DocumentScope = @import("DocumentScope.zig");
 pub const Declaration = DocumentScope.Declaration;
 pub const Scope = DocumentScope.Scope;
