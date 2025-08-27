@@ -96,44 +96,19 @@ pub const Builder = struct {
 
         const tree = builder.handle.tree;
 
-        // 1) Barebones refactor: extract selected range into a new function
-        // Offer this when the selection is non-empty.
         const start_index = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
-        const end_index = offsets.positionToIndex(tree.source, range.end, builder.offset_encoding);
-        if (end_index > start_index) {
-            try generateExtractFunctionCodeAction(builder, .{ .start = start_index, .end = end_index });
-        }
+        const range_loc = offsets.rangeToLoc(tree.source, range, builder.offset_encoding);
 
-        // 2) Encapsulate function params into a struct (when cursor is on a function)
-        {
-            const source_index_fn = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
-            try generateEncapsulateParamsStructAction(builder, source_index_fn);
-        }
+        try generateExtractFunctionCodeAction(builder, range_loc);
+        try generateEncapsulateParamsStructAction(builder, start_index);
+        try generateHoistConstToFieldAction(builder, start_index);
+        try generateMoveDeclToTopLevelAction(builder, start_index);
+        try generateMoveTopLevelStructToFileAction(builder, start_index);
 
-        // 3) Hoist local const to container field (this.x = e) when inside a method with mutable receiver
-        {
-            const source_index_var = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
-            try generateHoistConstToFieldAction(builder, source_index_var);
-        }
-
-        // 4) Move local const to top-level (module) when initializer has no local dependencies
-        {
-            const source_index_mv = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
-            try generateMoveDeclToTopLevelAction(builder, source_index_mv);
-        }
-
-        // 4) Move top-level struct to new file
-        {
-            const source_index_struct = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
-            try generateMoveTopLevelStructToFileAction(builder, source_index_struct);
-        }
-
-        // 6) Existing string literal refactors (only when cursor is in a string)
-        const source_index = offsets.positionToIndex(tree.source, range.start, builder.offset_encoding);
-        const ctx = try Analyser.getPositionContext(builder.arena, builder.handle.tree, source_index, true);
+        const ctx = try Analyser.getPositionContext(builder.arena, builder.handle.tree, start_index, true);
         if (ctx != .string_literal) return;
 
-        var token_idx = offsets.sourceIndexToTokenIndex(tree, source_index).pickPreferred(&.{ .string_literal, .multiline_string_literal_line }, &tree) orelse return;
+        var token_idx = offsets.sourceIndexToTokenIndex(tree, start_index).pickPreferred(&.{ .string_literal, .multiline_string_literal_line }, &tree) orelse return;
 
         // if `offsets.sourceIndexToTokenIndex` is called with a source index between two tokens, it will be the token to the right.
         switch (tree.tokenTag(token_idx)) {
@@ -207,6 +182,79 @@ pub const Builder = struct {
         var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
         try self.addWorkspaceTextEdit(&workspace_edit, self.handle.uri, edits);
         return workspace_edit;
+    }
+};
+
+const DocumentChange = types.TypePaths.@"WorkspaceEdit/documentChanges";
+const TextEdit = types.TypePaths.@"TextDocumentEdit/edits";
+
+const EditBuilder = struct {
+    alloc: std.mem.Allocator,
+    dcs: std.ArrayList(DocumentChange) = .{},
+    changes: std.json.ArrayHashMap([]const types.TextEdit) = .{},
+
+    pub fn init(a: std.mem.Allocator) EditBuilder {
+        return .{ .alloc = a };
+    }
+
+    pub fn deinit(self: *EditBuilder) void {
+        self.dcs.deinit();
+    }
+
+    pub fn createFile(
+        self: *EditBuilder,
+        uri: types.DocumentUri,
+    ) !void {
+        try self.dcs.append(self.alloc, .{
+            .CreateFile = .{
+                .uri = uri,
+                .options = .{ .ignoreIfExists = true },
+            },
+        });
+    }
+
+    pub fn textDocumentEdit(
+        self: *EditBuilder,
+        tde: types.TextDocumentEdit,
+    ) !void {
+        try self.dcs.append(self.alloc, .{ .TextDocumentEdit = tde });
+    }
+
+    pub fn insertAtPosition(
+        self: *EditBuilder,
+        uri: types.DocumentUri,
+        source: []const u8,
+        position: types.Position,
+        text: []const u8,
+    ) !void {
+        try self.replaceRange(uri, source, .{ .start = position, .end = position }, text);
+    }
+
+    pub fn replaceRange(
+        self: *EditBuilder,
+        uri: types.DocumentUri,
+        source: []const u8,
+        range: types.Range,
+        text: []const u8,
+    ) !void {
+        _ = source; // autofix
+        var edits: []types.TextEdit = try self.alloc.alloc(types.TextEdit, 1);
+        edits[0] = .{
+            .range = range,
+            .newText = try self.alloc.dupe(u8, text),
+        };
+
+        try self.changes.map.putNoClobber(self.alloc, uri, edits);
+
+        std.debug.print("changes: {f}\n", .{std.json.fmt(self.changes, .{ .whitespace = .indent_2 })});
+    }
+
+    pub fn build(self: *EditBuilder) !types.WorkspaceEdit {
+        return types.WorkspaceEdit{
+            .changes = self.changes,
+            .changeAnnotations = .{ .map = .{} },
+            .documentChanges = try self.dcs.toOwnedSlice(self.alloc),
+        };
     }
 };
 
@@ -1565,21 +1613,19 @@ pub const GenerateMoveTopLevelStructToFileActionator = struct {
         const new_fs_path = try std.fs.path.join(this.builder.arena, &.{ cur_dir, filename });
         const new_uri = Uri.fromPath(this.builder.arena, new_fs_path) catch return;
 
-        var workspace_edit: types.WorkspaceEdit = .{};
-        workspace_edit.documentChanges = &.{
-            .{ .CreateFile = .{ .uri = new_uri } },
-            .{ .TextDocumentEdit = .{
-                .textDocument = .{ .uri = this.builder.handle.uri, .version = null },
-                .edits = &.{ .{ .TextEdit = this.builder.createTextEditLoc(replace_loc, import_text.items) } },
-            } },
-            .{ .TextDocumentEdit = .{
-                .textDocument = .{ .uri = new_uri, .version = null },
-                .edits = &.{ .{ .TextEdit = this.builder.createTextEditPos(0, file_text.items) } },
-            } },
-        };
+        var eb = EditBuilder.init(this.builder.arena);
+        try eb.createFile(new_uri);
+        try eb.insertAtPosition(new_uri, "", .{ .line = 0, .character = 0 }, file_text.items);
+        const replace_range = offsets.locToRange(tree.source, replace_loc, this.builder.offset_encoding);
+        _ = replace_range; // autofix
+        //        try eb.replaceRange(this.builder.handle.uri, tree.source, replace_range, import_text.items);
+
+        const workspace_edit = try eb.build();
+
+        std.debug.print("workspace_edit: {f}\n", .{std.json.fmt(workspace_edit, .{ .whitespace = .indent_2 })});
 
         try this.builder.actions.append(this.builder.arena, .{
-            .title = try std.fmt.allocPrint(this.builder.arena, "move to new {s}", .{filename}),
+            .title = try std.fmt.allocPrint(this.builder.arena, "move to new file", .{}),
             .kind = .refactor,
             .isPreferred = false,
             .edit = workspace_edit,

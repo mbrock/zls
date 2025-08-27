@@ -1,7 +1,7 @@
 .{
     .name = .zls,
     // Must match the `zls_version` in `build.zig`
-    .version = "0.15.0-dev",
+    .version = "0.16.0-dev",
     // Must be kept in line with the `minimum_build_zig_version` in `build.zig`.
     // Should be a Zig version that is downloadable from https://ziglang.org/download/ or a mirror.
     .minimum_zig_version = "0.15.1",
@@ -20,9 +20,8 @@
             .url = "https://github.com/ziglibs/diffz/archive/a20dd1f11b10819a6f570f98b42e1c91e3704357.tar.gz",
             .hash = "diffz-0.0.1-G2tlIQrOAQCfH15jdyaLyrMgV8eGPouFhkCeYFTmJaLk",
         },
-        .lsp_kit = .{
-            .url = "https://github.com/zigtools/lsp-kit/archive/576e9405b1ab22c17c0f9318feed3278aa66b0ea.tar.gz",
-            .hash = "lsp_kit-0.1.0-bi_PL04yCgAxLsF0hH2a5sZKT84MGQaKXouw2jvCE8Nl",
+        .lsp_kit_src = .{
+            .path = "vendor/lsp-kit/",
         },
         .tracy = .{
             .url = "https://github.com/wolfpld/tracy/archive/refs/tags/v0.11.1.tar.gz",

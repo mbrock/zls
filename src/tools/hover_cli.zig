@@ -1,10 +1,3 @@
-//! Minimal, robust CLI for ZLS hover and symbols
-//! Usage:
-//!   hover info <file> [line] [column]  # Shows symbols for file/dir, or hover info for line/col
-//!   hover pagerank [path]
-//!   hover xref <file> <line> <column>
-//!   hover refactor <file> <line> <column> [<end_line> <end_col>] [--apply N]
-
 const std = @import("std");
 const zls = @import("zls");
 const types = zls.lsp.types;
@@ -17,12 +10,7 @@ const hover_symbols = @import("hover/symbols.zig");
 const hover_pagerank = @import("hover/pagerank.zig");
 const hover_argv = @import("hover/argv.zig");
 
-// TODO: When ZLS exposes symbol→decl mapping and structured signature/type
-// APIs, migrate printing to use those directly for richer details (visibility,
-// attributes, fully-qualified types) without additional AST probing here.
-
 const outPrint = hover_util.outPrint;
-
 
 const Command = enum { info, pagerank, xref, refactor };
 
@@ -40,7 +28,6 @@ const InfoArgs = struct {
     @"--minimal": bool = false,
 };
 
-
 const PagerankArgs = struct {
     path: []const u8 = ".",
     @"--surf-main": bool = false,
@@ -55,7 +42,6 @@ const XrefArgs = struct {
     col: u32 = 0,
 };
 
-
 const RefactorArgs = struct {
     file: []const u8 = "",
     line: u32 = 0,
@@ -64,7 +50,6 @@ const RefactorArgs = struct {
     end_col: ?u32 = null,
     @"--apply": ?usize = null,
 };
-
 
 // Union-based subcommand parsing via argv.parseArgs/dispatch
 const Cli = union(enum) {
@@ -95,36 +80,9 @@ const openDocument = hover_server.openDocument;
 
 const analyzeSymbolsWithZLS = hover_symbols.analyzeSymbolsWithZLS;
 
-// moved to hover/symbols.zig
-
-// moved to hover/symbols.zig
-
-
-// Print a top-level function symbol with its structured signature when available.
-// Leverages symbol.detail which document_symbol fills using ZLS analysis.
-// moved to hover/symbols.zig
-
-// Print a method inside a container with indentation and signature when available.
-// moved to hover/symbols.zig
-
-
-
-
-
-
-
-
-// moved to hover/symbols.zig
-
-// moved to hover/symbols.zig
-
-
-
 const printSymbols = hover_symbols.printSymbols;
 
 const printSymbolInformation = hover_symbols.printSymbolInformation;
-
-// moved to hover/symbols.zig
 
 const printDiff = hover_util.printDiff;
 
@@ -150,7 +108,10 @@ fn walkZigFiles(allocator: std.mem.Allocator, root_dir_path: []const u8, out_lis
             if (ent.kind == .directory) {
                 var skip = false;
                 for (ignore_dirs) |name| {
-                    if (std.mem.eql(u8, ent.name, name)) { skip = true; break; }
+                    if (std.mem.eql(u8, ent.name, name)) {
+                        skip = true;
+                        break;
+                    }
                 }
                 if (skip) continue;
                 const sub = try std.fs.path.join(allocator, &.{ dir_path, ent.name });
@@ -165,7 +126,6 @@ fn walkZigFiles(allocator: std.mem.Allocator, root_dir_path: []const u8, out_lis
         // No-op free with program-scoped arena
     }
 }
-
 
 const PRNode = struct {
     name: []const u8,
@@ -203,17 +163,17 @@ fn computePageRank(nodes: []PRNode, iters: u32, damping: f64, allocator: std.mem
 
 fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: []const u8) !void {
     var timer = std.time.Timer.start() catch return;
-    
+
     const abs_root = try std.fs.cwd().realpathAlloc(allocator, root_path);
     var files: std.ArrayList([]const u8) = .empty;
-    
+
     // Check if it's a single file or directory
     const stat = std.fs.cwd().statFile(abs_root) catch blk: {
         // Try as directory if file stat fails
         try walkZigFiles(allocator, abs_root, &files);
         break :blk null;
     };
-    
+
     if (stat) |s| {
         if (s.kind == .file and std.mem.endsWith(u8, abs_root, ".zig")) {
             try files.append(allocator, abs_root);
@@ -221,9 +181,9 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
             try walkZigFiles(allocator, abs_root, &files);
         }
     }
-    
+
     const file_walk_time = timer.lap();
-    std.debug.print("[DEBUG] File discovery: {}ms (found {} files)\n", .{file_walk_time / std.time.ns_per_ms, files.items.len});
+    std.debug.print("[DEBUG] File discovery: {}ms (found {} files)\n", .{ file_walk_time / std.time.ns_per_ms, files.items.len });
 
     var nodes: std.ArrayList(PRNode) = .empty;
     var index_by_key = std.StringHashMap(u32).init(allocator);
@@ -239,7 +199,9 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
         for (arr) |s| {
             if (!(s.kind == .Function or s.kind == .Method)) continue;
             const key = std.fmt.allocPrint(allocator, "{s}:{d}", .{ h.uri, s.selectionRange.start.line }) catch continue;
-            if (index_by_key.get(key)) |_| { continue; }
+            if (index_by_key.get(key)) |_| {
+                continue;
+            }
             const node = PRNode{
                 .name = allocator.dupe(u8, s.name) catch continue,
                 .kind = s.kind,
@@ -252,9 +214,9 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
             index_by_key.put(key, idx) catch {};
         }
     }
-    
+
     const node_build_time = timer.lap();
-    std.debug.print("[DEBUG] Node building: {}ms ({} nodes from {} files)\n", .{node_build_time / std.time.ns_per_ms, nodes.items.len, max_files});
+    std.debug.print("[DEBUG] Node building: {}ms ({} nodes from {} files)\n", .{ node_build_time / std.time.ns_per_ms, nodes.items.len, max_files });
 
     var syms_cache = std.StringHashMap([]const types.DocumentSymbol).init(allocator);
 
@@ -265,11 +227,11 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
     var cache_hits: usize = 0;
     var edges_added: usize = 0;
     var node_batch_timer = timer.lap();
-    
+
     while (j < nodes.items.len) : (j += 1) {
         const node_start = timer.read();
         const n = nodes.items[j];
-        
+
         // Time the reference request
         const ref_start = timer.read();
         // Use internal references handler directly (no LSP transport)
@@ -281,7 +243,7 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
         const refs = if (refs_response) |rep| rep.references else null;
         total_ref_requests += 1;
         const ref_time = timer.read() - ref_start;
-        
+
         if (refs) |locs| {
             refs_processed += locs.len;
             for (locs) |loc| {
@@ -299,7 +261,7 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
                     break :blk arr2;
                 };
                 _ = timer.read() - sym_start; // sym_time unused
-                
+
                 var caller_idx: ?u32 = null;
                 for (caller_syms) |s| {
                     const r = s.range;
@@ -317,43 +279,45 @@ fn handlePagerank(allocator: std.mem.Allocator, server: *zls.Server, root_path: 
                 }
             }
         }
-        
+
         _ = timer.read() - node_start; // node_time unused
         if ((j + 1) % 5 == 0 or j + 1 == nodes.items.len) {
             const batch_time = timer.lap() - node_batch_timer;
             const progress_time = timer.read() / std.time.ns_per_ms;
-            std.debug.print("[DEBUG] Batch {}-{}: {}ms | Node '{s}': refs={}, refTime={}ms | Total: {}ms, edges={}\n", 
-                .{j - 4, j + 1, batch_time / std.time.ns_per_ms, n.name, if (refs) |r| r.len else 0, 
-                  ref_time / std.time.ns_per_ms, progress_time, edges_added});
+            std.debug.print("[DEBUG] Batch {}-{}: {}ms | Node '{s}': refs={}, refTime={}ms | Total: {}ms, edges={}\n", .{ j - 4, j + 1, batch_time / std.time.ns_per_ms, n.name, if (refs) |r| r.len else 0, ref_time / std.time.ns_per_ms, progress_time, edges_added });
             node_batch_timer = timer.read();
         }
         if ((j + 1) % 20 == 0 or j + 1 == nodes.items.len) {
-            std.debug.print("[DEBUG] Stats: refReqs={}, symReqs={}, cacheHits={}, edges={}, refs={}\n", 
-                .{total_ref_requests, total_symbol_requests, cache_hits, edges_added, refs_processed});
+            std.debug.print("[DEBUG] Stats: refReqs={}, symReqs={}, cacheHits={}, edges={}, refs={}\n", .{ total_ref_requests, total_symbol_requests, cache_hits, edges_added, refs_processed });
         }
     }
-    
+
     const ref_analysis_time = timer.lap();
-    std.debug.print("[DEBUG] Reference analysis complete: {}ms ({} total references)\n", .{ref_analysis_time / std.time.ns_per_ms, refs_processed});
+    std.debug.print("[DEBUG] Reference analysis complete: {}ms ({} total references)\n", .{ ref_analysis_time / std.time.ns_per_ms, refs_processed });
 
     std.debug.print("[DEBUG] Starting PageRank computation (20 iterations, damping=0.85)...\n", .{});
     computePageRank(nodes.items, 20, 0.85, allocator);
-    
+
     const pagerank_time = timer.lap();
     std.debug.print("[DEBUG] PageRank computation: {}ms\n", .{pagerank_time / std.time.ns_per_ms});
-    
+
     var idxs = std.ArrayList(u32).empty;
     if (idxs.resize(allocator, nodes.items.len)) |_| {} else |_| return;
     for (idxs.items, 0..) |*v, k| v.* = @intCast(k);
-    const Ctx = struct { nodes: []PRNode, pub fn lessThan(ctx: @This(), a: u32, b: u32) bool { return ctx.nodes[a].score > ctx.nodes[b].score; } };
+    const Ctx = struct {
+        nodes: []PRNode,
+        pub fn lessThan(ctx: @This(), a: u32, b: u32) bool {
+            return ctx.nodes[a].score > ctx.nodes[b].score;
+        }
+    };
     std.mem.sort(u32, idxs.items, Ctx{ .nodes = nodes.items }, Ctx.lessThan);
-    
+
     const sort_time = timer.lap();
     std.debug.print("[DEBUG] Sorting results: {}ms\n", .{sort_time / std.time.ns_per_ms});
-    
+
     const total_time = timer.read() / std.time.ns_per_ms;
     std.debug.print("[DEBUG] Total pagerank time: {}ms\n", .{total_time});
-    
+
     const top = @min(@as(usize, 20), idxs.items.len);
     outPrint("PageRank Top {d} (functions/methods)\n", .{top});
     var k: usize = 0;
@@ -381,7 +345,6 @@ fn handleXref(allocator: std.mem.Allocator, server: *zls.Server, file: []const u
         outPrint("References: 0\n", .{});
     }
 }
-
 
 const ensureDirForFile = hover_util.ensureDirForFile;
 
@@ -447,16 +410,28 @@ pub fn main() !u8 {
     var ctx = HoverCtx{ .allocator = allocator };
     defer if (ctx.server) |s| s.destroy();
 
-    const handlers = .{
-        .pagerank = struct { fn f(c: *HoverCtx, args: PagerankArgs) !void {
+    hover_argv.dispatch(Cli, allocator, argv, 1, &ctx, handlers) catch |e| {
+        outPrint("Error: {any}\n", .{e});
+        return 1;
+    };
+    return 0;
+}
+
+const handlers = .{
+    .pagerank = struct {
+        fn f(c: *HoverCtx, args: PagerankArgs) !void {
             const server = try c.ensureServer();
             try hover_pagerank.pagerank(server, c.allocator, args.path, .{ .surf_main = args.@"--surf-main", .surf_from = args.@"--surf-from", .show_sites = args.@"--show-sites", .show_chains = args.@"--show-chains" });
-        } }.f,
-        .xref = struct { fn f(c: *HoverCtx, args: XrefArgs) !void {
+        }
+    }.f,
+    .xref = struct {
+        fn f(c: *HoverCtx, args: XrefArgs) !void {
             const server = try c.ensureServer();
             try handleXref(c.allocator, server, args.file, args.line, args.col);
-        } }.f,
-        .refactor = struct { fn f(c: *HoverCtx, args: RefactorArgs) !void {
+        }
+    }.f,
+    .refactor = struct {
+        fn f(c: *HoverCtx, args: RefactorArgs) !void {
             const server = try c.ensureServer();
             const content = try std.fs.cwd().readFileAlloc(c.allocator, args.file, std.math.maxInt(usize));
             const handle = try openDocument(server, c.allocator, args.file, content);
@@ -465,12 +440,12 @@ pub fn main() !u8 {
             const params: types.CodeActionParams = .{
                 .textDocument = .{ .uri = handle.uri },
                 .range = .{ .start = start_pos, .end = end_pos },
-                .context = .{ .diagnostics = &.{}, .only = &.{ .refactor } },
+                .context = .{ .diagnostics = &.{}, .only = &.{.refactor} },
             };
             const response = try server.sendRequestSync(c.allocator, "textDocument/codeAction", params);
             if (response == null) return error.NoActions;
             const actions = response.?;
-            
+
             if (args.@"--apply") |idx| {
                 if (idx >= actions.len) return error.InvalidIndex;
                 const chosen = actions[idx].CodeAction;
@@ -489,12 +464,14 @@ pub fn main() !u8 {
                 }
                 if (count == 0) outPrint("No refactor actions.\n", .{});
             }
-        } }.f,
-        .info = struct { fn f(c: *HoverCtx, args: InfoArgs) !void {
+        }
+    }.f,
+    .info = struct {
+        fn f(c: *HoverCtx, args: InfoArgs) !void {
             const server = try c.ensureServer();
             const abs_path = try std.fs.cwd().realpathAlloc(c.allocator, args.file);
             const stat = try std.fs.cwd().statFile(abs_path);
-            
+
             if (args.line != 0 and args.col != 0) {
                 // Always show hover info when line/column provided
                 const content = try std.fs.cwd().readFileAlloc(c.allocator, args.file, std.math.maxInt(usize));
@@ -507,13 +484,13 @@ pub fn main() !u8 {
                 if (result) |hover_val| {
                     const mc = hover_val.contents.MarkupContent;
                     outPrint("{s}\n", .{mc.value});
-                    
+
                     // Check if this position points to a container type and show its symbols
                     var analyser = server.initAnalyser(c.allocator, handle);
                     defer analyser.deinit();
                     const source_index = offsets.positionToIndex(handle.tree.source, .{ .line = args.line - 1, .character = args.col - 1 }, server.offset_encoding);
                     const pos_context = Analyser.getPositionContext(c.allocator, handle.tree, source_index, true) catch return;
-                    
+
                     // Only show container members when pointing directly at type names, not variables of those types
                     const should_show_container = switch (pos_context) {
                         .var_access => blk: {
@@ -531,25 +508,25 @@ pub fn main() !u8 {
                         },
                         else => false,
                     };
-                    
+
                     if (should_show_container) {
-                            const sym_params: types.DocumentSymbolParams = .{ .textDocument = .{ .uri = handle.uri } };
-                            const syms = try server.sendRequestSync(c.allocator, "textDocument/documentSymbol", sym_params);
-                            if (syms) |resp| {
-                                outPrint("\nContainer members:\n", .{});
-                                const opts: SymbolsOptions = .{
-                                    .show_public = !args.@"--private",
-                                    .show_private = args.@"--private",
-                                    .show_imports = args.@"--imports",
-                                    .show_locations = args.@"--locations",
-                                    .api_only = args.@"--api",
-                                    .minimal = args.@"--minimal",
-                                };
-                                switch (resp) {
-                                    .array_of_DocumentSymbol => |arr| printSymbols(c.allocator, server, handle, arr, opts),
-                                    .array_of_SymbolInformation => |infos| printSymbolInformation(infos),
-                                }
+                        const sym_params: types.DocumentSymbolParams = .{ .textDocument = .{ .uri = handle.uri } };
+                        const syms = try server.sendRequestSync(c.allocator, "textDocument/documentSymbol", sym_params);
+                        if (syms) |resp| {
+                            outPrint("\nContainer members:\n", .{});
+                            const opts: SymbolsOptions = .{
+                                .show_public = !args.@"--private",
+                                .show_private = args.@"--private",
+                                .show_imports = args.@"--imports",
+                                .show_locations = args.@"--locations",
+                                .api_only = args.@"--api",
+                                .minimal = args.@"--minimal",
+                            };
+                            switch (resp) {
+                                .array_of_DocumentSymbol => |arr| printSymbols(c.allocator, server, handle, arr, opts),
+                                .array_of_SymbolInformation => |infos| printSymbolInformation(infos),
                             }
+                        }
                     }
                 } else {
                     outPrint("No hover info.\n", .{});
@@ -591,14 +568,14 @@ pub fn main() !u8 {
                             switch (resp) {
                                 .array_of_DocumentSymbol => |arr| {
                                     if (arr.len > 0) {
-                                        outPrint("\n📁 {s} ({d} symbols)\n", .{rel_path, arr.len});
+                                        outPrint("\n📁 {s} ({d} symbols)\n", .{ rel_path, arr.len });
                                         printSymbols(c.allocator, server, handle, arr, opts);
                                         total_symbols += arr.len;
                                     }
                                 },
                                 .array_of_SymbolInformation => |infos| {
                                     if (infos.len > 0) {
-                                        outPrint("\n📁 {s} ({d} symbols)\n", .{rel_path, infos.len});
+                                        outPrint("\n📁 {s} ({d} symbols)\n", .{ rel_path, infos.len });
                                         printSymbolInformation(infos);
                                         total_symbols += infos.len;
                                     }
@@ -606,18 +583,12 @@ pub fn main() !u8 {
                             }
                         }
                     }
-                    outPrint("\n📊 Summary: {d} symbols across {d} files\n", .{total_symbols, max_files});
+                    outPrint("\n📊 Summary: {d} symbols across {d} files\n", .{ total_symbols, max_files });
                 }
             } else {
                 outPrint("Provide a .zig file or directory path.\n", .{});
                 return error.InvalidUsage;
             }
-        } }.f,
-    };
-
-    hover_argv.dispatch(Cli, allocator, argv, 1, &ctx, handlers) catch |e| {
-        outPrint("Error: {any}\n", .{e});
-        return 1;
-    };
-    return 0;
-}
+        }
+    }.f,
+};
