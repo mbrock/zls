@@ -208,7 +208,7 @@ const EditBuilder = struct {
         try self.dcs.append(self.alloc, .{
             .CreateFile = .{
                 .uri = uri,
-                .options = .{ .ignoreIfExists = true },
+                .options = .{ .overwrite = true },
             },
         });
     }
@@ -217,42 +217,40 @@ const EditBuilder = struct {
         self: *EditBuilder,
         tde: types.TextDocumentEdit,
     ) !void {
-        try self.dcs.append(self.alloc, .{ .TextDocumentEdit = tde });
+        try self.dcs.append(self.alloc, DocumentChange{ .TextDocumentEdit = tde });
     }
 
     pub fn insertAtPosition(
         self: *EditBuilder,
         uri: types.DocumentUri,
-        source: []const u8,
         position: types.Position,
         text: []const u8,
     ) !void {
-        try self.replaceRange(uri, source, .{ .start = position, .end = position }, text);
+        try self.replaceRange(uri, .{ .start = position, .end = position }, text);
     }
 
     pub fn replaceRange(
         self: *EditBuilder,
         uri: types.DocumentUri,
-        source: []const u8,
         range: types.Range,
         text: []const u8,
     ) !void {
-        _ = source; // autofix
-        var edits: []types.TextEdit = try self.alloc.alloc(types.TextEdit, 1);
-        edits[0] = .{
+        var edits: []TextEdit = try self.alloc.alloc(TextEdit, 1);
+        edits[0] = TextEdit{ .TextEdit = types.TextEdit{
             .range = range,
             .newText = try self.alloc.dupe(u8, text),
+        } };
+
+        const tde = types.TextDocumentEdit{
+            .edits = try self.alloc.dupe(TextEdit, edits),
+            .textDocument = .{ .uri = uri, .version = 100 },
         };
 
-        try self.changes.map.putNoClobber(self.alloc, uri, edits);
-
-        std.debug.print("changes: {f}\n", .{std.json.fmt(self.changes, .{ .whitespace = .indent_2 })});
+        try self.textDocumentEdit(tde);
     }
 
     pub fn build(self: *EditBuilder) !types.WorkspaceEdit {
         return types.WorkspaceEdit{
-            .changes = self.changes,
-            .changeAnnotations = .{ .map = .{} },
             .documentChanges = try self.dcs.toOwnedSlice(self.alloc),
         };
     }
@@ -1615,20 +1613,15 @@ pub const GenerateMoveTopLevelStructToFileActionator = struct {
 
         var eb = EditBuilder.init(this.builder.arena);
         try eb.createFile(new_uri);
-        try eb.insertAtPosition(new_uri, "", .{ .line = 0, .character = 0 }, file_text.items);
+        try eb.insertAtPosition(new_uri, .{ .line = 0, .character = 0 }, file_text.items);
         const replace_range = offsets.locToRange(tree.source, replace_loc, this.builder.offset_encoding);
-        _ = replace_range; // autofix
-        //        try eb.replaceRange(this.builder.handle.uri, tree.source, replace_range, import_text.items);
-
-        const workspace_edit = try eb.build();
-
-        std.debug.print("workspace_edit: {f}\n", .{std.json.fmt(workspace_edit, .{ .whitespace = .indent_2 })});
+        try eb.replaceRange(this.builder.handle.uri, replace_range, import_text.items);
 
         try this.builder.actions.append(this.builder.arena, .{
             .title = try std.fmt.allocPrint(this.builder.arena, "move to new file", .{}),
             .kind = .refactor,
             .isPreferred = false,
-            .edit = workspace_edit,
+            .edit = try eb.build(),
         });
     }
 };
