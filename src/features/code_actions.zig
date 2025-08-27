@@ -33,6 +33,7 @@ pub const Builder = struct {
         var remove_capture_actions: std.AutoHashMapUnmanaged(types.Range, void) = .empty;
 
         try handleUnorganizedImport(builder);
+        try handleNormalizeImport(builder);
 
         if (error_bundle.errorMessageCount() == 0) return; // `getMessages` can't be called on an empty ErrorBundle
         for (error_bundle.getMessages()) |msg_index| {
@@ -188,7 +189,7 @@ pub const Builder = struct {
 const DocumentChange = types.TypePaths.@"WorkspaceEdit/documentChanges";
 const TextEdit = types.TypePaths.@"TextDocumentEdit/edits";
 
-const EditBuilder = struct {
+pub const EditBuilder = struct {
     alloc: std.mem.Allocator,
     dcs: std.ArrayList(DocumentChange) = .{},
     changes: std.json.ArrayHashMap([]const types.TextEdit) = .{},
@@ -837,6 +838,85 @@ fn handleUnorganizedImport(builder: *Builder) !void {
     });
 }
 
+fn getImportStringToken(tree: Ast, var_decl_node: Ast.Node.Index) ?Ast.TokenIndex {
+    if (tree.nodeTag(var_decl_node) != .simple_var_decl) return null;
+    const var_decl = tree.simpleVarDecl(var_decl_node);
+    var current_node = var_decl.ast.init_node.unwrap() orelse return null;
+    while (true) {
+        switch (tree.nodeTag(current_node)) {
+            .field_access => {
+                // Drill down to base of field access: left side
+                current_node = tree.nodeData(current_node).node_and_token[0];
+                continue;
+            },
+            .builtin_call_two, .builtin_call_two_comma => {
+                const first_param, const second_param = tree.nodeData(current_node).opt_node_and_opt_node;
+                const param_node = first_param.unwrap() orelse return null;
+                if (second_param != .none) return null;
+                if (tree.nodeTag(param_node) != .string_literal) return null;
+                return tree.nodeMainToken(param_node);
+            },
+            else => return null,
+        }
+    }
+}
+
+fn normalizeImportPath(allocator: std.mem.Allocator, current_dir: []const u8, quoted: []const u8) !?[]const u8 {
+    if (quoted.len < 2 or quoted[0] != '"' or quoted[quoted.len - 1] != '"') return null;
+    const inner = quoted[1 .. quoted.len - 1];
+    // Quick no-op for already relative simple paths
+    if (inner.len != 0 and inner[0] != '/' and !(inner.len >= 3 and inner[1] == ':' and inner[2] == '\\')) {
+        return null;
+    }
+    // Resolve absolute to relative if possible
+    const abs = inner;
+    const rel = std.fs.path.relative(allocator, current_dir, abs) catch abs;
+    if (std.mem.eql(u8, rel, inner)) return null;
+    return try std.fmt.allocPrint(allocator, "\"{s}\"", .{rel});
+}
+
+fn handleNormalizeImport(builder: *Builder) !void {
+    const tracy_zone = tracy.trace(@src());
+    defer tracy_zone.end();
+
+    if (!builder.wantKind(.@"source.organizeImports")) return;
+
+    const tree = builder.handle.tree;
+    if (tree.errors.len != 0) return;
+
+    const imports = try getImportsDecls(builder, builder.arena);
+    if (imports.len == 0) return;
+
+    const cur_fs_path = Uri.toFsPath(builder.arena, builder.handle.uri) catch return;
+    const cur_dir = std.fs.path.dirname(cur_fs_path) orelse ".";
+
+    var edits: std.ArrayList(types.TextEdit) = .empty;
+    for (imports) |imp| {
+        if (imp.getKind() != .file) continue;
+        const tok = getImportStringToken(tree, imp.var_decl) orelse continue;
+        const range = offsets.tokenToRange(tree, tok, builder.offset_encoding);
+        const old_text = offsets.tokenToSlice(tree, tok);
+        const maybe_new = try normalizeImportPath(builder.arena, cur_dir, old_text);
+        if (maybe_new) |new_text| {
+            if (!std.mem.eql(u8, new_text, old_text)) {
+                try edits.append(builder.arena, .{ .range = range, .newText = new_text });
+            }
+        }
+    }
+
+    if (edits.items.len == 0) return;
+
+    var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
+    try builder.addWorkspaceTextEdit(&workspace_edit, builder.handle.uri, edits.items);
+
+    try builder.actions.append(builder.arena, .{
+        .title = "normalize @import paths",
+        .kind = .@"source.organizeImports",
+        .isPreferred = false,
+        .edit = workspace_edit,
+    });
+}
+
 /// const name_slice = @import(value_slice);
 pub const ImportDecl = struct {
     var_decl: Ast.Node.Index,
@@ -1477,357 +1557,11 @@ fn generateMoveTopLevelStructToFileAction(builder: *Builder, source_index: usize
     _ = try args.generateMoveTopLevelStructToFileAction();
 }
 
-pub const GenerateMoveTopLevelStructToFileActionator = struct {
-    builder: *Builder,
-    source_index: usize,
+pub const GenerateMoveTopLevelStructToFileActionator = @import("GenerateMoveTopLevelStructToFileActionator.zig").GenerateMoveTopLevelStructToFileActionator;
 
-    pub fn generateMoveTopLevelStructToFileAction(this: *@This()) !void {
-        const tracy_zone = tracy.trace(@src());
-        defer tracy_zone.end();
 
-        if (!this.builder.wantKind(.refactor)) return;
+const GenerateHoistConstToFieldActionator = @import("GenerateHoistConstToFieldActionator.zig").GenerateHoistConstToFieldActionator;
 
-        const tree = this.builder.handle.tree;
-        const nodes = try ast.nodesOverlappingIndex(this.builder.arena, tree, this.source_index);
-        if (nodes.len == 0) return;
-
-        var top_decl: ?Ast.Node.Index = null;
-        for (nodes) |n| {
-            if (tree.nodeTag(n) == .global_var_decl) {
-                top_decl = n;
-                break;
-            }
-            if (tree.nodeTag(n) == .simple_var_decl) {
-                if (tree.fullVarDecl(n)) |v| {
-                    if (tree.tokenTag(v.ast.mut_token) == .keyword_const) {
-                        top_decl = n;
-                        break;
-                    }
-                }
-            }
-        }
-        const decl_node = top_decl orelse return;
-        const v = tree.fullVarDecl(decl_node).?;
-        if (tree.tokenTag(v.ast.mut_token) != .keyword_const) return;
-        const init = v.ast.init_node.unwrap() orelse return;
-        if (tree.tokenTag(tree.nodeMainToken(init)) != .keyword_struct) return;
-        const name_tok = v.ast.mut_token + 1;
-        if (tree.tokenTag(name_tok) != .identifier) return;
-        const name = offsets.identifierTokenToNameSlice(tree, name_tok);
-        if (std.mem.eql(u8, name, "_")) return;
-
-        // New file content with alias prelude (std + referenced decls from any file)
-        const vis = if (v.visib_token != null) "pub " else "";
-        // Scan init subtree tokens for references
-        const init_first = tree.firstToken(init);
-        const init_last = ast.lastToken(tree, init);
-        var needs_std = false;
-        const Alias = struct { alias: []const u8, import_path: []const u8, symbol: []const u8 };
-        var aliases: std.ArrayList(Alias) = .empty;
-        var used_aliases: std.StringHashMapUnmanaged(void) = .empty;
-        defer used_aliases.deinit(this.builder.arena);
-        var tok = init_first;
-        while (tok <= init_last) : (tok += 1) {
-            if (tree.tokenTag(tok) != .identifier) continue;
-            const id_name = offsets.identifierTokenToNameSlice(tree, tok);
-            if (std.mem.eql(u8, id_name, "_")) continue;
-            if (std.mem.eql(u8, id_name, "std")) {
-                needs_std = true;
-                continue;
-            }
-            const ref_decl = (try this.builder.analyser.lookupSymbolGlobal(
-                this.builder.handle,
-                id_name,
-                tree.tokenStart(tok),
-            )) orelse continue;
-            const ref_name_tok = ref_decl.nameToken();
-            const ref_name = offsets.identifierTokenToNameSlice(tree, ref_name_tok);
-            if (std.mem.eql(u8, ref_name, name)) continue; // skip self
-
-            // Determine import path
-            const dep_uri = ref_decl.handle.uri;
-            var import_path: []const u8 = undefined;
-            if (std.mem.eql(u8, dep_uri, this.builder.handle.uri)) {
-                const cur_path = Uri.toFsPath(this.builder.arena, dep_uri) catch dep_uri;
-                import_path = std.fs.path.basename(cur_path);
-            } else {
-                // use absolute fs path for robustness
-                import_path = Uri.toFsPath(this.builder.arena, dep_uri) catch dep_uri;
-            }
-
-            // Ensure unique alias name
-            var alias_name = ref_name;
-            var suffix: usize = 1;
-            while (used_aliases.get(alias_name) != null) : (suffix += 1) {
-                alias_name = try std.fmt.allocPrint(this.builder.arena, "{s}{d}", .{ ref_name, suffix });
-            }
-            const gop = try used_aliases.getOrPut(this.builder.arena, alias_name);
-            if (!gop.found_existing) gop.key_ptr.* = alias_name;
-            try aliases.append(this.builder.arena, .{ .alias = alias_name, .import_path = import_path, .symbol = ref_name });
-        }
-
-        var file_text: std.ArrayList(u8) = .empty;
-        if (needs_std) {
-            try file_text.appendSlice(this.builder.arena, "const std = @import(\"std\");\n");
-        }
-        for (aliases.items) |a| {
-            try file_text.appendSlice(this.builder.arena, "const ");
-            try file_text.appendSlice(this.builder.arena, a.alias);
-            try file_text.appendSlice(this.builder.arena, " = @import(\"");
-            try file_text.appendSlice(this.builder.arena, a.import_path);
-            try file_text.appendSlice(this.builder.arena, "\").");
-            try file_text.appendSlice(this.builder.arena, a.symbol);
-            try file_text.appendSlice(this.builder.arena, ";\n");
-        }
-        if (needs_std or aliases.items.len != 0) try file_text.appendSlice(this.builder.arena, "\n");
-        try file_text.appendSlice(this.builder.arena, vis);
-        try file_text.appendSlice(this.builder.arena, "const ");
-        try file_text.appendSlice(this.builder.arena, name);
-        try file_text.appendSlice(this.builder.arena, " = ");
-        try file_text.appendSlice(this.builder.arena, offsets.nodeToSlice(tree, init));
-        try file_text.appendSlice(this.builder.arena, ";\n");
-
-        // Replace original with import alias
-        var replace_loc = offsets.nodeToLoc(tree, decl_node);
-        const end_tok = ast.lastToken(tree, decl_node);
-        if (end_tok + 1 < tree.tokens.len and tree.tokenTag(end_tok + 1) == .semicolon) {
-            const semi_loc = offsets.tokensToLoc(tree, end_tok + 1, end_tok + 1);
-            if (semi_loc.end > replace_loc.end) replace_loc.end = semi_loc.end;
-        }
-        var import_text: std.ArrayList(u8) = .empty;
-        try import_text.appendSlice(this.builder.arena, vis);
-        try import_text.appendSlice(this.builder.arena, "const ");
-        try import_text.appendSlice(this.builder.arena, name);
-        try import_text.appendSlice(this.builder.arena, " = @import(\"");
-        const filename = try std.fmt.allocPrint(this.builder.arena, "{s}.zig", .{name});
-        try import_text.appendSlice(this.builder.arena, filename);
-        try import_text.appendSlice(this.builder.arena, "\").");
-        try import_text.appendSlice(this.builder.arena, name);
-        try import_text.appendSlice(this.builder.arena, ";\n");
-
-        // Build proper URIs and documentChanges (CreateFile + TextDocumentEdits)
-        const cur_fs_path = Uri.toFsPath(this.builder.arena, this.builder.handle.uri) catch return;
-        const cur_dir = std.fs.path.dirname(cur_fs_path) orelse ".";
-        const new_fs_path = try std.fs.path.join(this.builder.arena, &.{ cur_dir, filename });
-        const new_uri = Uri.fromPath(this.builder.arena, new_fs_path) catch return;
-
-        var eb = EditBuilder.init(this.builder.arena);
-        try eb.createFile(new_uri);
-        try eb.insertAtPosition(new_uri, .{ .line = 0, .character = 0 }, file_text.items);
-        const replace_range = offsets.locToRange(tree.source, replace_loc, this.builder.offset_encoding);
-        try eb.replaceRange(this.builder.handle.uri, replace_range, import_text.items);
-
-        try this.builder.actions.append(this.builder.arena, .{
-            .title = try std.fmt.allocPrint(this.builder.arena, "move to new file", .{}),
-            .kind = .refactor,
-            .isPreferred = false,
-            .edit = try eb.build(),
-        });
-    }
-};
-
-const GenerateHoistConstToFieldActionator = struct {
-    builder: *Builder,
-    source_index: usize,
-
-    pub fn generateHoistConstToFieldAction(this: *@This()) !void {
-        const tracy_zone = tracy.trace(@src());
-        defer tracy_zone.end();
-
-        if (!this.builder.wantKind(.refactor)) return;
-
-        const tree = this.builder.handle.tree;
-        const nodes = try ast.nodesOverlappingIndex(this.builder.arena, tree, this.source_index);
-        if (nodes.len == 0) return;
-
-        // Find nearest var decl node
-        var var_node_opt: ?Ast.Node.Index = null;
-        for (nodes) |n| {
-            switch (tree.nodeTag(n)) {
-                .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-                    var_node_opt = n;
-                    break;
-                },
-                else => {},
-            }
-        }
-        const var_node = var_node_opt orelse return;
-
-        const var_decl = tree.fullVarDecl(var_node).?;
-        const init_node = var_decl.ast.init_node.unwrap() orelse return;
-
-        // Get var name
-        const name_tok = var_decl.ast.mut_token + 1;
-        if (tree.tokenTag(name_tok) != .identifier) return;
-        const var_name = offsets.identifierTokenToNameSlice(tree, name_tok);
-        if (std.mem.eql(u8, var_name, "_")) return;
-
-        // Locate enclosing function and block
-        var func_node_opt: ?Ast.Node.Index = null;
-        for (nodes) |n| {
-            switch (tree.nodeTag(n)) {
-                .fn_decl => {
-                    func_node_opt = n;
-                    break;
-                },
-                else => {},
-            }
-        }
-        const func_node = func_node_opt orelse return;
-        const fn_proto, const fn_body = tree.nodeData(func_node).node_and_node;
-        if (fn_body == .root) return; // no body
-        const func_ty = try this.builder.analyser.resolveTypeOfNode(.of(func_node, this.builder.handle));
-
-        // Determine receiver param name by type identity to container
-        var buf: [1]Ast.Node.Index = undefined;
-        const proto = tree.fullFnProto(&buf, fn_proto).?;
-        const container_ty = try this.builder.analyser.innermostContainer(this.builder.handle, tree.tokenStart(proto.ast.fn_token));
-        const container_instance = (try container_ty.instanceTypeVal(this.builder.analyser)) orelse container_ty;
-        _ = container_instance; // autofix
-
-        // Only proceed for methods with a receiver parameter
-        const receiver = blk_recv: {
-            const ft = func_ty orelse break :blk_recv null;
-            if (ft.data != .function) break :blk_recv null;
-            const fndata = ft.data.function;
-            if (fndata.parameters.len == 0) break :blk_recv null;
-            const p0 = fndata.parameters[0];
-            if (p0.name) |nm| {
-                break :blk_recv nm;
-            } else break :blk_recv null;
-        } orelse return; // no receiver => not a method, skip this refactor
-
-        // Prepare container field insertion (infer type)
-        // Find enclosing container decl node
-        var container_node_opt: ?Ast.Node.Index = null;
-        for (nodes) |n| {
-            var cbuf: [2]Ast.Node.Index = undefined;
-            if (tree.fullContainerDecl(&cbuf, n)) |_| {
-                container_node_opt = n;
-                break;
-            }
-        }
-        const container_node = container_node_opt orelse return;
-        // Infer field type: prefer explicit type in decl, otherwise infer from initializer
-        const field_type_text = blk_ft: {
-            if (var_decl.ast.type_node.unwrap()) |tn| break :blk_ft offsets.nodeToSlice(tree, tn);
-            if (try this.builder.analyser.resolveTypeOfNode(.of(init_node, this.builder.handle))) |ty|
-                break :blk_ft try ty.stringifyTypeOf(this.builder.analyser, .{ .truncate_container_decls = false });
-            break :blk_ft "var"; // fallback unlikely
-        };
-        // Compute insertion point: before rbrace
-        // Choose indentation: use first member indent if available else 4 spaces inside container
-        var cbuf2: [2]Ast.Node.Index = undefined;
-        const cdecl = tree.fullContainerDecl(&cbuf2, container_node).?;
-        const field_indent = blk_ind: {
-            if (cdecl.ast.members.len > 0) {
-                const first_member = cdecl.ast.members[0];
-                const line = offsets.lineLocAtIndex(tree.source, offsets.nodeToLoc(tree, first_member).start);
-                var j: usize = line.start;
-                while (j < line.end and (tree.source[j] == ' ' or tree.source[j] == '\t')) j += 1;
-                break :blk_ind tree.source[line.start..j];
-            } else {
-                // indent = container line indent + 4 spaces
-                const cline = offsets.lineLocAtIndex(tree.source, offsets.nodeToLoc(tree, container_node).start);
-                var j: usize = cline.start;
-                while (j < cline.end and (tree.source[j] == ' ' or tree.source[j] == '\t')) j += 1;
-                const base = tree.source[cline.start..j];
-                break :blk_ind try std.mem.concat(this.builder.arena, u8, &.{ base, "    " });
-            }
-        };
-        // Choose insertion position: after last existing field; otherwise at top of container
-        var insert_pos: usize = undefined;
-        var last_field_node_opt: ?Ast.Node.Index = null;
-        for (cdecl.ast.members) |m| {
-            switch (tree.nodeTag(m)) {
-                .container_field, .container_field_init, .container_field_align => last_field_node_opt = m,
-                else => {},
-            }
-        }
-        if (last_field_node_opt) |last_field_node| {
-            insert_pos = offsets.nodeToLoc(tree, last_field_node).end;
-        } else if (cdecl.ast.members.len > 0) {
-            insert_pos = offsets.nodeToLoc(tree, cdecl.ast.members[0]).start;
-        } else {
-            // after '{'
-            var t = tree.firstToken(container_node);
-            while (t < tree.tokens.len and tree.tokenTag(t) != .l_brace) : (t += 1) {}
-            insert_pos = if (t < tree.tokens.len) tree.tokenStart(t) + 1 else offsets.nodeToLoc(tree, container_node).start;
-        }
-
-        var field_line: std.ArrayList(u8) = .empty;
-        // ensure there's a newline before rbrace, rely on formatter for commas
-        try field_line.appendSlice(this.builder.arena, "\n");
-        try field_line.appendSlice(this.builder.arena, field_indent);
-        try field_line.appendSlice(this.builder.arena, var_name);
-        try field_line.appendSlice(this.builder.arena, ": ");
-        try field_line.appendSlice(this.builder.arena, field_type_text);
-        try field_line.appendSlice(this.builder.arena, ",");
-        // Replace declaration with receiver.field assignment and update references to var_name -> receiver.var_name
-        const body_loc = offsets.nodeToLoc(tree, fn_body);
-        const decl_loc = offsets.nodeToLoc(tree, var_node);
-        // Include trailing semicolon if present
-        var decl_end = decl_loc.end;
-        const last_tok = ast.lastToken(tree, var_node);
-        if (last_tok + 1 < tree.tokens.len and tree.tokenTag(last_tok + 1) == .semicolon) {
-            const semi_loc = offsets.tokensToLoc(tree, last_tok + 1, last_tok + 1);
-            if (semi_loc.end > decl_end) decl_end = semi_loc.end;
-        }
-        const init_loc = offsets.nodeToLoc(tree, init_node);
-        // Compute indentation prefix from decl line
-        const decl_line = offsets.lineLocAtIndex(tree.source, decl_loc.start);
-        const indent_slice = blk: {
-            var j: usize = decl_line.start;
-            while (j < decl_loc.start and (tree.source[j] == ' ' or tree.source[j] == '\t')) j += 1;
-            break :blk tree.source[decl_line.start..j];
-        };
-        var assign_line: std.ArrayList(u8) = .empty;
-        try assign_line.appendSlice(this.builder.arena, indent_slice);
-        try assign_line.appendSlice(this.builder.arena, receiver);
-        try assign_line.appendSlice(this.builder.arena, ".");
-        try assign_line.appendSlice(this.builder.arena, var_name);
-        try assign_line.appendSlice(this.builder.arena, " = ");
-        try assign_line.appendSlice(this.builder.arena, tree.source[init_loc.start..init_loc.end]);
-        try assign_line.appendSlice(this.builder.arena, ";\n");
-        // Collect identifier references to this var after the decl
-        var repls: std.ArrayList(types.TextEdit) = .empty;
-        // Replace the decl
-        try repls.append(this.builder.arena, this.builder.createTextEditLoc(.{ .start = decl_loc.start, .end = decl_end }, assign_line.items));
-        // Insert the field at computed position
-        try repls.append(this.builder.arena, this.builder.createTextEditPos(insert_pos, field_line.items));
-        // Replace usages from end of decl to end of body
-        var tok_i = offsets.sourceIndexToTokenIndex(tree, decl_end).preferRight(&tree);
-        const end_tok = offsets.sourceIndexToTokenIndex(tree, body_loc.end).preferLeft();
-        // Resolve the declaration handle for equality
-        const decl_handle = (try this.builder.analyser.lookupSymbolGlobal(this.builder.handle, var_name, decl_loc.start)) orelse null;
-        if (decl_handle) |target_decl| {
-            while (tok_i <= end_tok) : (tok_i += 1) {
-                if (tree.tokenTag(tok_i) != .identifier) continue;
-                const name = offsets.identifierTokenToNameSlice(tree, tok_i);
-                if (!std.mem.eql(u8, name, var_name)) continue;
-                const tok_start = tree.tokenStart(tok_i);
-                if (try this.builder.analyser.lookupSymbolGlobal(this.builder.handle, name, tok_start)) |ref_decl| {
-                    if (!ref_decl.eql(target_decl)) continue;
-                    const tok_loc = offsets.tokenToLoc(tree, tok_i);
-                    var repl_text: std.ArrayList(u8) = .empty;
-                    try repl_text.appendSlice(this.builder.arena, receiver);
-                    try repl_text.appendSlice(this.builder.arena, ".");
-                    try repl_text.appendSlice(this.builder.arena, var_name);
-                    try repls.append(this.builder.arena, this.builder.createTextEditLoc(tok_loc, repl_text.items));
-                }
-            }
-        }
-        // Emit the action
-        var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
-        try this.builder.addWorkspaceTextEdit(&workspace_edit, this.builder.handle.uri, repls.items);
-        try this.builder.actions.append(this.builder.arena, .{
-            .title = "hoist local to field",
-            .kind = .refactor,
-            .isPreferred = false,
-            .edit = workspace_edit,
-        });
-    }
-};
 
 const GenerateEncapsulateParamsStructActionator = struct {
     builder: *Builder,

@@ -12,7 +12,7 @@ const hover_argv = @import("hover/argv.zig");
 
 const outPrint = hover_util.outPrint;
 
-const Command = enum { info, pagerank, xref, refactor };
+const Command = enum { info, pagerank, xref, refactor, actions };
 
 const SymbolsOptions = hover_opts.SymbolsOptions;
 
@@ -51,11 +51,22 @@ const RefactorArgs = struct {
     @"--apply": ?usize = null,
 };
 
+const ActionsArgs = struct {
+    file: []const u8 = "",
+    line: u32 = 1,
+    col: u32 = 1,
+    end_line: ?u32 = null,
+    end_col: ?u32 = null,
+    @"--kind": ?[]const u8 = null,
+    @"--apply": ?usize = null,
+};
+
 // Union-based subcommand parsing via argv.parseArgs/dispatch
 const Cli = union(enum) {
     pagerank: PagerankArgs,
     xref: XrefArgs,
     refactor: RefactorArgs,
+    actions: ActionsArgs,
     info: InfoArgs,
 };
 
@@ -464,6 +475,58 @@ const handlers = .{
                 }
                 if (count == 0) outPrint("No refactor actions.\n", .{});
             }
+        }
+    }.f,
+    .actions = struct {
+        fn parseKindTag(s: []const u8) ?types.CodeActionKind {
+            // Minimal mapping for common kinds
+            if (std.mem.eql(u8, s, "refactor")) return .refactor;
+            if (std.mem.eql(u8, s, "quickfix") or std.mem.eql(u8, s, "quickFix")) return .quickfix;
+            if (std.mem.eql(u8, s, "source.organizeImports")) return .@"source.organizeImports";
+            if (std.mem.eql(u8, s, "source.fixAll")) return .@"source.fixAll";
+            return null;
+        }
+        fn f(c: *HoverCtx, args: ActionsArgs) !void {
+            const server = try c.ensureServer();
+            const content = try std.fs.cwd().readFileAlloc(c.allocator, args.file, std.math.maxInt(usize));
+            const handle = try openDocument(server, c.allocator, args.file, content);
+            const start_pos: types.Position = .{ .line = args.line - 1, .character = args.col - 1 };
+            const end_pos: types.Position = if (args.end_line) |el| .{ .line = el - 1, .character = (args.end_col orelse 1) - 1 } else start_pos;
+            var ctx: types.CodeActionContext = .{ .diagnostics = &.{} };
+            if (args.@"--kind") |ks| {
+                if (parseKindTag(ks)) |k| {
+                    ctx.only = &.{k};
+                } else {
+                    outPrint("Unknown kind: {s}\n", .{ks});
+                }
+            }
+            const params: types.CodeActionParams = .{
+                .textDocument = .{ .uri = handle.uri },
+                .range = .{ .start = start_pos, .end = end_pos },
+                .context = ctx,
+            };
+            const response = try server.sendRequestSync(c.allocator, "textDocument/codeAction", params);
+            if (response == null) return error.NoActions;
+            const actions = response.?;
+
+            if (args.@"--apply") |idx| {
+                if (idx >= actions.len) return error.InvalidIndex;
+                const chosen = actions[idx].CodeAction;
+                if (chosen.edit) |we| {
+                    try applyWorkspaceEditToFs(c.allocator, server, we, false);
+                    outPrint("Applied: {s}\n", .{chosen.title});
+                } else return error.NoEdit;
+                return;
+            }
+
+            var count: usize = 0;
+            for (actions, 0..) |item, idx| {
+                const action = item.CodeAction;
+                const kind_str = if (action.kind) |k| @tagName(k) else "";
+                outPrint("{d}: {s}{s}{s}{s}\n", .{ idx, action.title, if (kind_str.len != 0) " [" else "", if (kind_str.len != 0) kind_str else "", if (kind_str.len != 0) "]" else "" });
+                count += 1;
+            }
+            if (count == 0) outPrint("No actions.\n", .{});
         }
     }.f,
     .info = struct {

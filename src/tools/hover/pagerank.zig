@@ -6,6 +6,13 @@ const hover_server = @import("server.zig");
 
 const outPrint = util.outPrint;
 
+const PagerankOptions = struct {
+    surf_main: bool = false,
+    surf_from: ?[]const u8 = null,
+    show_sites: bool = true,
+    show_chains: bool = true,
+};
+
 const PRNode = struct {
     name: []const u8,
     uri: []const u8,
@@ -117,12 +124,7 @@ pub fn pagerank(
     server: *zls.Server,
     allocator: std.mem.Allocator,
     root_path: []const u8,
-    opts: struct {
-        surf_main: bool = false,
-        surf_from: ?[]const u8 = null,
-        show_sites: bool = true,
-        show_chains: bool = true,
-    },
+    opts: PagerankOptions,
 ) !void {
     var args = Pagerankator{
         .server = server,
@@ -137,12 +139,7 @@ const Pagerankator = struct {
     server: *zls.Server,
     allocator: std.mem.Allocator,
     root_path: []const u8,
-    opts: struct {
-        surf_main: bool = false,
-        surf_from: ?[]const u8 = null,
-        show_sites: bool = true,
-        show_chains: bool = true,
-    },
+    opts: PagerankOptions,
 
     pub fn pagerank(this: *@This()) !void {
         var timer = try std.time.Timer.start();
@@ -233,23 +230,23 @@ const Pagerankator = struct {
                             var buf: [1]std.zig.Ast.Node.Index = undefined;
                             const fn_info = self.h.tree.fullFnProto(&buf, node).?;
                             const name_tok = fn_info.name_token orelse return;
-                            const pos = zls.offsets.tokenToPosition(self.h.tree, name_tok, self.this.server.offset_encoding);
-                            const key = try std.fmt.allocPrint(self.this.allocator, "{s}:{d}", .{ self.h.uri, pos.line });
+                            const pos = zls.offsets.tokenToPosition(self.h.tree, name_tok, self.server.offset_encoding);
+                            const key = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ self.h.uri, pos.line });
                             if (self.index_by_key.get(key)) |_| return;
                             if (self.nodes.items.len >= self.node_limit) return;
                             const nd = PRNode{
-                                .name = self.this.allocator.dupe(u8, zls.offsets.identifierTokenToNameSlice(self.h.tree, name_tok)) catch return,
-                                .uri = self.this.allocator.dupe(u8, self.h.uri) catch return,
+                                .name = self.allocator.dupe(u8, zls.offsets.identifierTokenToNameSlice(self.h.tree, name_tok)) catch return,
+                                .uri = self.allocator.dupe(u8, self.h.uri) catch return,
                                 .pos = pos,
                                 .fn_node = node,
                                 .container_name = blk: {
-                                    if (self.line_to_container.get(pos.line)) |cn| break :blk self.this.allocator.dupe(u8, cn) catch null;
+                                    if (self.line_to_container.get(pos.line)) |cn| break :blk self.allocator.dupe(u8, cn) catch null;
                                     break :blk null;
                                 },
                                 .out_edges = .empty,
                             };
                             const idx: u32 = @intCast(self.nodes.items.len);
-                            self.nodes.append(self.this.allocator, nd) catch return;
+                            self.nodes.append(self.allocator, nd) catch return;
                             _ = self.index_by_key.put(key, idx) catch {};
                         },
                         else => {},
