@@ -16,194 +16,239 @@ pub const GenerateHoistConstToFieldActionator = struct {
         const tracy_zone = tracy.trace(@src());
         defer tracy_zone.end();
 
-        if (this.builder.only_kinds) |set| {
-            if (!set.contains(.refactor)) return;
+        // Only offer this refactor for refactor code action requests
+        if (this.builder.only_kinds) |kind_filter| {
+            if (!kind_filter.contains(.refactor)) return;
         }
 
         const tree = this.builder.handle.tree;
-        const nodes = try ast.nodesOverlappingIndex(this.builder.arena, tree, this.source_index);
-        if (nodes.len == 0) return;
+        const overlapping_nodes = try ast.nodesOverlappingIndex(this.builder.arena, tree, this.source_index);
+        if (overlapping_nodes.len == 0) return;
 
-        // Find nearest var decl node
-        var var_node_opt: ?Ast.Node.Index = null;
-        for (nodes) |n| {
-            switch (tree.nodeTag(n)) {
+        // Find the variable declaration node at the cursor position
+        var target_var_node: ?Ast.Node.Index = null;
+        for (overlapping_nodes) |node| {
+            switch (tree.nodeTag(node)) {
                 .local_var_decl, .simple_var_decl, .aligned_var_decl => {
-                    var_node_opt = n;
+                    target_var_node = node;
                     break;
                 },
                 else => {},
             }
         }
-        const var_node = var_node_opt orelse return;
+        const var_declaration_node = target_var_node orelse return;
 
-        const var_decl = tree.fullVarDecl(var_node).?;
-        const init_node = var_decl.ast.init_node.unwrap() orelse return;
+        const variable_declaration = tree.fullVarDecl(var_declaration_node).?;
+        const initializer_node = variable_declaration.ast.init_node.unwrap() orelse return;
 
-        // Get var name
-        const name_tok = var_decl.ast.mut_token + 1;
-        if (tree.tokenTag(name_tok) != .identifier) return;
-        const var_name = offsets.identifierTokenToNameSlice(tree, name_tok);
-        if (std.mem.eql(u8, var_name, "_")) return;
+        // Extract the variable name from the declaration
+        const name_token = variable_declaration.ast.mut_token + 1;
+        if (tree.tokenTag(name_token) != .identifier) return;
+        const variable_name = offsets.identifierTokenToNameSlice(tree, name_token);
+        if (std.mem.eql(u8, variable_name, "_")) return; // Skip anonymous variables
 
-        // Locate enclosing function and block
-        var func_node_opt: ?Ast.Node.Index = null;
-        for (nodes) |n| {
-            switch (tree.nodeTag(n)) {
+        // Find the enclosing function that contains this variable
+        var enclosing_function_node: ?Ast.Node.Index = null;
+        for (overlapping_nodes) |node| {
+            switch (tree.nodeTag(node)) {
                 .fn_decl => {
-                    func_node_opt = n;
+                    enclosing_function_node = node;
                     break;
                 },
                 else => {},
             }
         }
-        const func_node = func_node_opt orelse return;
-        const fn_proto, const fn_body = tree.nodeData(func_node).node_and_node;
-        if (fn_body == .root) return; // no body
-        const func_ty = try this.builder.analyser.resolveTypeOfNode(.of(func_node, this.builder.handle));
+        const function_node = enclosing_function_node orelse return;
+        const function_prototype, const function_body = tree.nodeData(function_node).node_and_node;
+        if (function_body == .root) return; // Function has no body
+        const function_type = try this.builder.analyser.resolveTypeOfNode(.of(function_node, this.builder.handle));
 
-        // Determine receiver param name by type identity to container
-        var buf: [1]Ast.Node.Index = undefined;
-        const proto = tree.fullFnProto(&buf, fn_proto).?;
-        const container_ty = try this.builder.analyser.innermostContainer(this.builder.handle, tree.tokenStart(proto.ast.fn_token));
-        const container_instance = (try container_ty.instanceTypeVal(this.builder.analyser)) orelse container_ty;
-        _ = container_instance; // autofix
+        // Analyze the function to determine if it's a method with a receiver parameter
+        var proto_buffer: [1]Ast.Node.Index = undefined;
+        const prototype = tree.fullFnProto(&proto_buffer, function_prototype).?;
+        const container_type = try this.builder.analyser.innermostContainer(this.builder.handle, tree.tokenStart(prototype.ast.fn_token));
+        const container_instance = (try container_type.instanceTypeVal(this.builder.analyser)) orelse container_type;
+        _ = container_instance; // Unused but kept for potential future use
 
-        // Only proceed for methods with a receiver parameter
-        const receiver = blk_recv: {
-            const ft = func_ty orelse break :blk_recv null;
-            if (ft.data != .function) break :blk_recv null;
-            const fndata = ft.data.function;
-            if (fndata.parameters.len == 0) break :blk_recv null;
-            const p0 = fndata.parameters[0];
-            if (p0.name) |nm| {
-                break :blk_recv nm;
+        // Extract the receiver parameter name (first parameter of the method)
+        // Only proceed if this is a method with a receiver parameter
+        const receiver_parameter_name = blk_recv: {
+            const function_type_info = function_type orelse break :blk_recv null;
+            if (function_type_info.data != .function) break :blk_recv null;
+            const function_data = function_type_info.data.function;
+            if (function_data.parameters.len == 0) break :blk_recv null;
+            const first_parameter = function_data.parameters[0];
+            if (first_parameter.name) |parameter_name| {
+                break :blk_recv parameter_name;
             } else break :blk_recv null;
-        } orelse return; // no receiver => not a method, skip this refactor
+        } orelse return; // Not a method - skip this refactor
 
-        // Prepare container field insertion (infer type)
-        // Find enclosing container decl node
-        var container_node_opt: ?Ast.Node.Index = null;
-        for (nodes) |n| {
-            var cbuf: [2]Ast.Node.Index = undefined;
-            if (tree.fullContainerDecl(&cbuf, n)) |_| {
-                container_node_opt = n;
+        // Find the enclosing container (struct/union) where we'll add the field
+        var target_container_node: ?Ast.Node.Index = null;
+        for (overlapping_nodes) |node| {
+            var container_buffer: [2]Ast.Node.Index = undefined;
+            if (tree.fullContainerDecl(&container_buffer, node)) |_| {
+                target_container_node = node;
                 break;
             }
         }
-        const container_node = container_node_opt orelse return;
-        // Infer field type: prefer explicit type in decl, otherwise infer from initializer
-        const field_type_text = blk_ft: {
-            if (var_decl.ast.type_node.unwrap()) |tn| break :blk_ft offsets.nodeToSlice(tree, tn);
-            if (try this.builder.analyser.resolveTypeOfNode(.of(init_node, this.builder.handle))) |ty|
-                break :blk_ft try ty.stringifyTypeOf(this.builder.analyser, .{ .truncate_container_decls = false });
-            break :blk_ft "var"; // fallback unlikely
+        const container_node = target_container_node orelse return;
+        
+        // Determine the field type: use explicit type if available, otherwise infer from initializer
+        const field_type_text = blk_field_type: {
+            if (variable_declaration.ast.type_node.unwrap()) |type_node| 
+                break :blk_field_type offsets.nodeToSlice(tree, type_node);
+            if (try this.builder.analyser.resolveTypeOfNode(.of(initializer_node, this.builder.handle))) |inferred_type|
+                break :blk_field_type try inferred_type.stringifyTypeOf(this.builder.analyser, .{ .truncate_container_decls = false });
+            break :blk_field_type "var"; // Fallback (unlikely case)
         };
-        // Compute insertion point: before rbrace
-        // Choose indentation: use first member indent if available else 4 spaces inside container
-        var cbuf2: [2]Ast.Node.Index = undefined;
-        const cdecl = tree.fullContainerDecl(&cbuf2, container_node).?;
-        const field_indent = blk_ind: {
-            if (cdecl.ast.members.len > 0) {
-                const first_member = cdecl.ast.members[0];
-                const line = offsets.lineLocAtIndex(tree.source, offsets.nodeToLoc(tree, first_member).start);
-                var j: usize = line.start;
-                while (j < line.end and (tree.source[j] == ' ' or tree.source[j] == '\t')) j += 1;
-                break :blk_ind tree.source[line.start..j];
+        // Calculate proper indentation for the new field by examining existing container members
+        var container_decl_buffer: [2]Ast.Node.Index = undefined;
+        const container_declaration = tree.fullContainerDecl(&container_decl_buffer, container_node).?;
+        const field_indentation = blk_indent: {
+            if (container_declaration.ast.members.len > 0) {
+                // Use the same indentation as the first existing member
+                const first_member = container_declaration.ast.members[0];
+                const member_line = offsets.lineLocAtIndex(tree.source, offsets.nodeToLoc(tree, first_member).start);
+                var indent_end: usize = member_line.start;
+                while (indent_end < member_line.end and (tree.source[indent_end] == ' ' or tree.source[indent_end] == '\t')) {
+                    indent_end += 1;
+                }
+                break :blk_indent tree.source[member_line.start..indent_end];
             } else {
-                // indent = container line indent + 4 spaces
-                const cline = offsets.lineLocAtIndex(tree.source, offsets.nodeToLoc(tree, container_node).start);
-                var j: usize = cline.start;
-                while (j < cline.end and (tree.source[j] == ' ' or tree.source[j] == '\t')) j += 1;
-                const base = tree.source[cline.start..j];
-                break :blk_ind try std.mem.concat(this.builder.arena, u8, &.{ base, "    " });
+                // No existing members - use container indentation + 4 spaces
+                const container_line = offsets.lineLocAtIndex(tree.source, offsets.nodeToLoc(tree, container_node).start);
+                var indent_end: usize = container_line.start;
+                while (indent_end < container_line.end and (tree.source[indent_end] == ' ' or tree.source[indent_end] == '\t')) {
+                    indent_end += 1;
+                }
+                const base_indentation = tree.source[container_line.start..indent_end];
+                break :blk_indent try std.mem.concat(this.builder.arena, u8, &.{ base_indentation, "    " });
             }
         };
-        // Choose insertion position: after last existing field; otherwise at top of container
-        var insert_pos: usize = undefined;
-        var last_field_node_opt: ?Ast.Node.Index = null;
-        for (cdecl.ast.members) |m| {
-            switch (tree.nodeTag(m)) {
-                .container_field, .container_field_init, .container_field_align => last_field_node_opt = m,
+        // Determine where to insert the new field within the container
+        var field_insertion_position: usize = undefined;
+        var last_existing_field: ?Ast.Node.Index = null;
+        
+        // Find the last existing field in the container
+        for (container_declaration.ast.members) |member| {
+            switch (tree.nodeTag(member)) {
+                .container_field, .container_field_init, .container_field_align => last_existing_field = member,
                 else => {},
             }
         }
-        if (last_field_node_opt) |last_field_node| {
-            insert_pos = offsets.nodeToLoc(tree, last_field_node).end;
-        } else if (cdecl.ast.members.len > 0) {
-            insert_pos = offsets.nodeToLoc(tree, cdecl.ast.members[0]).start;
+        
+        if (last_existing_field) |last_field| {
+            // Insert after the last existing field
+            field_insertion_position = offsets.nodeToLoc(tree, last_field).end;
+        } else if (container_declaration.ast.members.len > 0) {
+            // No fields but other members exist - insert before first member
+            field_insertion_position = offsets.nodeToLoc(tree, container_declaration.ast.members[0]).start;
         } else {
-            // after '{'
-            var t = tree.firstToken(container_node);
-            while (t < tree.tokens.len and tree.tokenTag(t) != .l_brace) : (t += 1) {}
-            insert_pos = if (t < tree.tokens.len) tree.tokenStart(t) + 1 else offsets.nodeToLoc(tree, container_node).start;
+            // Empty container - insert after the opening brace
+            var token_index = tree.firstToken(container_node);
+            while (token_index < tree.tokens.len and tree.tokenTag(token_index) != .l_brace) : (token_index += 1) {}
+            field_insertion_position = if (token_index < tree.tokens.len) 
+                tree.tokenStart(token_index) + 1 
+            else 
+                offsets.nodeToLoc(tree, container_node).start;
         }
 
-        var field_line: std.ArrayList(u8) = .empty;
-        // ensure there's a newline before rbrace, rely on formatter for commas
-        try field_line.appendSlice(this.builder.arena, "\n");
-        try field_line.appendSlice(this.builder.arena, field_indent);
-        try field_line.appendSlice(this.builder.arena, var_name);
-        try field_line.appendSlice(this.builder.arena, ": ");
-        try field_line.appendSlice(this.builder.arena, field_type_text);
-        try field_line.appendSlice(this.builder.arena, ",");
-        // Replace declaration with receiver.field assignment and update references to var_name -> receiver.var_name
-        const body_loc = offsets.nodeToLoc(tree, fn_body);
-        const decl_loc = offsets.nodeToLoc(tree, var_node);
-        // Include trailing semicolon if present
-        var decl_end = decl_loc.end;
-        const last_tok = ast.lastToken(tree, var_node);
-        if (last_tok + 1 < tree.tokens.len and tree.tokenTag(last_tok + 1) == .semicolon) {
-            const semi_loc = offsets.tokensToLoc(tree, last_tok + 1, last_tok + 1);
-            if (semi_loc.end > decl_end) decl_end = semi_loc.end;
+        // Build the field declaration text (e.g., "field_name: FieldType,")
+        var field_declaration_text: std.ArrayList(u8) = .empty;
+        try field_declaration_text.appendSlice(this.builder.arena, "\n"); // Ensure newline before the field
+        try field_declaration_text.appendSlice(this.builder.arena, field_indentation);
+        try field_declaration_text.appendSlice(this.builder.arena, variable_name);
+        try field_declaration_text.appendSlice(this.builder.arena, ": ");
+        try field_declaration_text.appendSlice(this.builder.arena, field_type_text);
+        try field_declaration_text.appendSlice(this.builder.arena, ",");
+        
+        // Prepare to replace the local variable declaration with field assignment
+        const function_body_location = offsets.nodeToLoc(tree, function_body);
+        const variable_declaration_location = offsets.nodeToLoc(tree, var_declaration_node);
+        // Include trailing semicolon in the replacement range if present
+        var declaration_end_position = variable_declaration_location.end;
+        const last_declaration_token = ast.lastToken(tree, var_declaration_node);
+        if (last_declaration_token + 1 < tree.tokens.len and tree.tokenTag(last_declaration_token + 1) == .semicolon) {
+            const semicolon_location = offsets.tokensToLoc(tree, last_declaration_token + 1, last_declaration_token + 1);
+            if (semicolon_location.end > declaration_end_position) {
+                declaration_end_position = semicolon_location.end;
+            }
         }
-        const init_loc = offsets.nodeToLoc(tree, init_node);
-        // Compute indentation prefix from decl line
-        const decl_line = offsets.lineLocAtIndex(tree.source, decl_loc.start);
-        const indent_slice = blk: {
-            var j: usize = decl_line.start;
-            while (j < decl_loc.start and (tree.source[j] == ' ' or tree.source[j] == '\t')) j += 1;
-            break :blk tree.source[decl_line.start..j];
+        
+        const initializer_location = offsets.nodeToLoc(tree, initializer_node);
+        
+        // Extract indentation from the original declaration line to maintain consistent formatting
+        const declaration_line = offsets.lineLocAtIndex(tree.source, variable_declaration_location.start);
+        const declaration_indentation = blk_declaration_indent: {
+            var indent_end: usize = declaration_line.start;
+            while (indent_end < variable_declaration_location.start and 
+                  (tree.source[indent_end] == ' ' or tree.source[indent_end] == '\t')) {
+                indent_end += 1;
+            }
+            break :blk_declaration_indent tree.source[declaration_line.start..indent_end];
         };
-        var assign_line: std.ArrayList(u8) = .empty;
-        try assign_line.appendSlice(this.builder.arena, indent_slice);
-        try assign_line.appendSlice(this.builder.arena, receiver);
-        try assign_line.appendSlice(this.builder.arena, ".");
-        try assign_line.appendSlice(this.builder.arena, var_name);
-        try assign_line.appendSlice(this.builder.arena, " = ");
-        try assign_line.appendSlice(this.builder.arena, tree.source[init_loc.start..init_loc.end]);
-        try assign_line.appendSlice(this.builder.arena, ";\n");
-        // Collect identifier references to this var after the decl
-        var repls: std.ArrayList(types.TextEdit) = .empty;
-        // Replace the decl
-        try repls.append(this.builder.arena, this.builder.createTextEditLoc(.{ .start = decl_loc.start, .end = decl_end }, assign_line.items));
-        // Insert the field at computed position
-        try repls.append(this.builder.arena, this.builder.createTextEditPos(insert_pos, field_line.items));
-        // Replace usages from end of decl to end of body
-        var tok_i = offsets.sourceIndexToTokenIndex(tree, decl_end).preferRight(&tree);
-        const end_tok = offsets.sourceIndexToTokenIndex(tree, body_loc.end).preferLeft();
-        // Resolve the declaration handle for equality
-        const decl_handle = (try this.builder.analyser.lookupSymbolGlobal(this.builder.handle, var_name, decl_loc.start)) orelse null;
-        if (decl_handle) |target_decl| {
-            while (tok_i <= end_tok) : (tok_i += 1) {
-                if (tree.tokenTag(tok_i) != .identifier) continue;
-                const name = offsets.identifierTokenToNameSlice(tree, tok_i);
-                if (!std.mem.eql(u8, name, var_name)) continue;
-                const tok_start = tree.tokenStart(tok_i);
-                if (try this.builder.analyser.lookupSymbolGlobal(this.builder.handle, name, tok_start)) |ref_decl| {
-                    if (!ref_decl.eql(target_decl)) continue;
-                    const tok_loc = offsets.tokenToLoc(tree, tok_i);
-                    var repl_text: std.ArrayList(u8) = .empty;
-                    try repl_text.appendSlice(this.builder.arena, receiver);
-                    try repl_text.appendSlice(this.builder.arena, ".");
-                    try repl_text.appendSlice(this.builder.arena, var_name);
-                    try repls.append(this.builder.arena, this.builder.createTextEditLoc(tok_loc, repl_text.items));
+        // Build the assignment statement to replace the variable declaration
+        // (e.g., "self.field_name = initializer_value;")
+        var assignment_statement: std.ArrayList(u8) = .empty;
+        try assignment_statement.appendSlice(this.builder.arena, declaration_indentation);
+        try assignment_statement.appendSlice(this.builder.arena, receiver_parameter_name);
+        try assignment_statement.appendSlice(this.builder.arena, ".");
+        try assignment_statement.appendSlice(this.builder.arena, variable_name);
+        try assignment_statement.appendSlice(this.builder.arena, " = ");
+        try assignment_statement.appendSlice(this.builder.arena, tree.source[initializer_location.start..initializer_location.end]);
+        try assignment_statement.appendSlice(this.builder.arena, ";\n");
+        
+        // Collect all the text edits needed for this refactoring
+        var text_edits: std.ArrayList(types.TextEdit) = .empty;
+        
+        // Replace the original variable declaration with the field assignment
+        try text_edits.append(this.builder.arena, this.builder.createTextEditLoc(.{ 
+            .start = variable_declaration_location.start, 
+            .end = declaration_end_position 
+        }, assignment_statement.items));
+        
+        // Insert the field declaration in the container
+        try text_edits.append(this.builder.arena, this.builder.createTextEditPos(
+            field_insertion_position, 
+            field_declaration_text.items
+        ));
+        // Find and update all usages of the variable within the function body
+        // Replace "variable_name" with "receiver.variable_name"
+        var current_token = offsets.sourceIndexToTokenIndex(tree, declaration_end_position).preferRight(&tree);
+        const function_end_token = offsets.sourceIndexToTokenIndex(tree, function_body_location.end).preferLeft();
+        
+        // Get a handle to the original variable declaration for comparison
+        const original_declaration_handle = (try this.builder.analyser.lookupSymbolGlobal(
+            this.builder.handle, 
+            variable_name, 
+            variable_declaration_location.start
+        )) orelse null;
+        
+        if (original_declaration_handle) |target_declaration| {
+            while (current_token <= function_end_token) : (current_token += 1) {
+                if (tree.tokenTag(current_token) != .identifier) continue;
+                
+                const token_name = offsets.identifierTokenToNameSlice(tree, current_token);
+                if (!std.mem.eql(u8, token_name, variable_name)) continue;
+                
+                const token_start_position = tree.tokenStart(current_token);
+                if (try this.builder.analyser.lookupSymbolGlobal(this.builder.handle, token_name, token_start_position)) |reference_declaration| {
+                    if (!reference_declaration.eql(target_declaration)) continue;
+                    
+                    // This is a reference to our variable - replace it with receiver.variable_name
+                    const token_location = offsets.tokenToLoc(tree, current_token);
+                    var replacement_text: std.ArrayList(u8) = .empty;
+                    try replacement_text.appendSlice(this.builder.arena, receiver_parameter_name);
+                    try replacement_text.appendSlice(this.builder.arena, ".");
+                    try replacement_text.appendSlice(this.builder.arena, variable_name);
+                    try text_edits.append(this.builder.arena, this.builder.createTextEditLoc(token_location, replacement_text.items));
                 }
             }
         }
-        // Emit the action
+        // Create and register the code action
         var workspace_edit: types.WorkspaceEdit = .{ .changes = .{} };
-        try this.builder.addWorkspaceTextEdit(&workspace_edit, this.builder.handle.uri, repls.items);
+        try this.builder.addWorkspaceTextEdit(&workspace_edit, this.builder.handle.uri, text_edits.items);
         try this.builder.actions.append(this.builder.arena, .{
             .title = "hoist local to field",
             .kind = .refactor,

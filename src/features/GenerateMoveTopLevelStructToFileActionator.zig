@@ -14,202 +14,225 @@ pub const GenerateMoveTopLevelStructToFileActionator = struct {
     builder: *Builder,
     source_index: usize,
 
+    /// Extracts a top-level struct declaration into its own file.
+    /// Creates MyStruct.zig with the struct definition and replaces the original
+    /// with an import statement. Automatically generates necessary imports.
     pub fn generateMoveTopLevelStructToFileAction(this: *@This()) !void {
         const tracy_zone = tracy.trace(@src());
         defer tracy_zone.end();
 
-        if (this.builder.only_kinds) |set| {
-            if (!set.contains(.refactor)) return;
+        // Only offer this refactor for refactor code action requests
+        if (this.builder.only_kinds) |kind_filter| {
+            if (!kind_filter.contains(.refactor)) return;
         }
 
         const tree = this.builder.handle.tree;
-        const nodes = try ast.nodesOverlappingIndex(this.builder.arena, tree, this.source_index);
-        if (nodes.len == 0) return;
+        const overlapping_nodes = try ast.nodesOverlappingIndex(this.builder.arena, tree, this.source_index);
+        if (overlapping_nodes.len == 0) return;
 
-        var top_decl: ?Ast.Node.Index = null;
-        for (nodes) |n| {
-            if (tree.nodeTag(n) == .global_var_decl) {
-                top_decl = n;
+        // Find a top-level struct declaration at the cursor position
+        var target_struct_declaration: ?Ast.Node.Index = null;
+        for (overlapping_nodes) |node| {
+            if (tree.nodeTag(node) == .global_var_decl) {
+                target_struct_declaration = node;
                 break;
             }
-            if (tree.nodeTag(n) == .simple_var_decl) {
-                if (tree.fullVarDecl(n)) |v| {
-                    if (tree.tokenTag(v.ast.mut_token) == .keyword_const) {
-                        top_decl = n;
+            if (tree.nodeTag(node) == .simple_var_decl) {
+                if (tree.fullVarDecl(node)) |variable_declaration| {
+                    if (tree.tokenTag(variable_declaration.ast.mut_token) == .keyword_const) {
+                        target_struct_declaration = node;
                         break;
                     }
                 }
             }
         }
-        const decl_node = top_decl orelse return;
-        const v = tree.fullVarDecl(decl_node).?;
-        if (tree.tokenTag(v.ast.mut_token) != .keyword_const) return;
-        const init = v.ast.init_node.unwrap() orelse return;
-        if (tree.tokenTag(tree.nodeMainToken(init)) != .keyword_struct) return;
-        const name_tok = v.ast.mut_token + 1;
-        if (tree.tokenTag(name_tok) != .identifier) return;
-        const name = offsets.identifierTokenToNameSlice(tree, name_tok);
-        if (std.mem.eql(u8, name, "_")) return;
+        const struct_declaration_node = target_struct_declaration orelse return;
+        const struct_variable_declaration = tree.fullVarDecl(struct_declaration_node).?;
+        
+        // Validate this is a const declaration
+        if (tree.tokenTag(struct_variable_declaration.ast.mut_token) != .keyword_const) return;
+        
+        // Validate the initializer is a struct
+        const struct_initializer = struct_variable_declaration.ast.init_node.unwrap() orelse return;
+        if (tree.tokenTag(tree.nodeMainToken(struct_initializer)) != .keyword_struct) return;
+        
+        // Extract the struct name
+        const struct_name_token = struct_variable_declaration.ast.mut_token + 1;
+        if (tree.tokenTag(struct_name_token) != .identifier) return;
+        const struct_name = offsets.identifierTokenToNameSlice(tree, struct_name_token);
+        if (std.mem.eql(u8, struct_name, "_")) return; // Skip anonymous structs
 
-        // New file content with alias prelude (std + referenced decls from any file)
-        const vis = if (v.visib_token != null) "pub " else "";
-        // Scan init subtree tokens for references
-        const init_first = tree.firstToken(init);
-        const init_last = ast.lastToken(tree, init);
-        var needs_std = false;
-        // Keep a stable list for emission and maps to dedupe/avoid alias collisions.
-        const Alias = struct { alias: []const u8, import_path: []const u8, symbol: []const u8 };
-        var aliases: std.ArrayList(Alias) = .empty;
-        var used_aliases: std.StringHashMapUnmanaged(void) = .empty; // tracks alias names
-        var seen_imports: std.StringHashMapUnmanaged(void) = .empty; // tracks unique import_path+"\x1f"+symbol
-        defer used_aliases.deinit(this.builder.arena);
-        defer seen_imports.deinit(this.builder.arena);
-        var tok = init_first;
-        while (tok <= init_last) : (tok += 1) {
-            if (tree.tokenTag(tok) != .identifier) continue;
-            const id_name = offsets.identifierTokenToNameSlice(tree, tok);
-            if (std.mem.eql(u8, id_name, "_")) continue;
-            if (std.mem.eql(u8, id_name, "std")) {
-                needs_std = true;
+        // Determine visibility for the new file content
+        const visibility_modifier = if (struct_variable_declaration.visib_token != null) "pub " else "";
+        
+        // Scan the struct definition for external references that need to be imported
+        const struct_first_token = tree.firstToken(struct_initializer);
+        const struct_last_token = ast.lastToken(tree, struct_initializer);
+        var needs_std_import = false;
+        
+        // Track dependencies to generate proper import statements
+        const ImportDependency = struct { 
+            alias: []const u8, 
+            import_path: []const u8, 
+            symbol: []const u8 
+        };
+        var import_dependencies: std.ArrayList(ImportDependency) = .empty;
+        var used_alias_names: std.StringHashMapUnmanaged(void) = .empty; // Prevents alias name collisions
+        var processed_imports: std.StringHashMapUnmanaged(void) = .empty; // Deduplicates imports by path+symbol
+        defer used_alias_names.deinit(this.builder.arena);
+        defer processed_imports.deinit(this.builder.arena);
+        // Iterate through all tokens in the struct definition to find external references
+        var current_token = struct_first_token;
+        while (current_token <= struct_last_token) : (current_token += 1) {
+            if (tree.tokenTag(current_token) != .identifier) continue;
+            
+            const identifier_name = offsets.identifierTokenToNameSlice(tree, current_token);
+            if (std.mem.eql(u8, identifier_name, "_")) continue; // Skip anonymous identifiers
+            
+            // Check if this references the standard library
+            if (std.mem.eql(u8, identifier_name, "std")) {
+                needs_std_import = true;
                 continue;
             }
-            const ref_decl = (try this.builder.analyser.lookupSymbolGlobal(
+            // Look up the symbol this identifier refers to
+            const referenced_declaration = (try this.builder.analyser.lookupSymbolGlobal(
                 this.builder.handle,
-                id_name,
-                tree.tokenStart(tok),
+                identifier_name,
+                tree.tokenStart(current_token),
             )) orelse continue;
-            const ref_name_tok = ref_decl.nameToken();
-            const ref_tree = ref_decl.handle.tree;
-            // Accept only AST decls that are importable and top-level
-            var allow = false;
-            switch (ref_decl.decl) {
+            
+            const referenced_name_token = referenced_declaration.nameToken();
+            const referenced_tree = referenced_declaration.handle.tree;
+            // Validate that this declaration can be imported
+            var is_importable = false;
+            switch (referenced_declaration.decl) {
                 .ast_node => |node| {
                     // Only importable categories
-                    switch (ref_tree.nodeTag(node)) {
+                    switch (referenced_tree.nodeTag(node)) {
                         .global_var_decl, .simple_var_decl, .aligned_var_decl,
                         .fn_decl, .fn_proto, .fn_proto_one, .fn_proto_multi, .fn_proto_simple,
-                        => allow = true,
-                        else => allow = false,
+                        => is_importable = true,
+                        else => is_importable = false,
                     }
-                    if (allow) {
+                    if (is_importable) {
                         // Same-file: require it to be a root declaration
-                        if (std.mem.eql(u8, ref_decl.handle.uri, this.builder.handle.uri)) {
-                            var is_root = false;
-                            for (ref_tree.rootDecls()) |rd| {
-                                if (rd == node) { is_root = true; break; }
+                        if (std.mem.eql(u8, referenced_declaration.handle.uri, this.builder.handle.uri)) {
+                            var is_root_declaration = false;
+                            for (referenced_tree.rootDecls()) |root_decl| {
+                                if (root_decl == node) { is_root_declaration = true; break; }
                             }
-                            allow = is_root;
+                            is_importable = is_root_declaration;
                         } else {
                             // Cross-file: container check is enough here; visibility checked below
-                            const src_idx = ref_tree.tokenStart(ref_name_tok);
-                            const doc_scope = try ref_decl.handle.getDocumentScope();
-                            const scope_opt = Analyser.innermostScopeAtIndexWithTag(doc_scope, src_idx, .init(.{ .container = true }));
-                            allow = if (scope_opt.unwrap()) |scope_idx| scope_idx == .root else false;
+                            const source_index = referenced_tree.tokenStart(referenced_name_token);
+                            const document_scope = try referenced_declaration.handle.getDocumentScope();
+                            const scope_result = Analyser.innermostScopeAtIndexWithTag(document_scope, source_index, .init(.{ .container = true }));
+                            is_importable = if (scope_result.unwrap()) |scope_index| scope_index == .root else false;
                         }
                     }
                 },
-                else => allow = false,
+                else => is_importable = false,
             }
-            if (!allow) continue;
+            if (!is_importable) continue;
 
-            const ref_name = offsets.identifierTokenToNameSlice(ref_tree, ref_name_tok);
-            if (std.mem.eql(u8, ref_name, name)) continue; // skip self
+            const referenced_symbol_name = offsets.identifierTokenToNameSlice(referenced_tree, referenced_name_token);
+            if (std.mem.eql(u8, referenced_symbol_name, struct_name)) continue; // Skip self-reference
             // Skip members declared within the moved container's init
-            if (std.mem.eql(u8, ref_decl.handle.uri, this.builder.handle.uri)) {
-                if (ref_name_tok >= init_first and ref_name_tok <= init_last) continue;
+            if (std.mem.eql(u8, referenced_declaration.handle.uri, this.builder.handle.uri)) {
+                if (referenced_name_token >= struct_first_token and referenced_name_token <= struct_last_token) continue;
             }
             // For cross-file imports, require public visibility
-            if (!std.mem.eql(u8, ref_decl.handle.uri, this.builder.handle.uri)) {
-                if (!ref_decl.isPublic()) continue;
+            if (!std.mem.eql(u8, referenced_declaration.handle.uri, this.builder.handle.uri)) {
+                if (!referenced_declaration.isPublic()) continue;
             }
 
             // Determine import path
-            const dep_uri = ref_decl.handle.uri;
+            const dependency_uri = referenced_declaration.handle.uri;
             var import_path: []const u8 = undefined;
-            if (std.mem.eql(u8, dep_uri, this.builder.handle.uri)) {
-                const cur_path = Uri.toFsPath(this.builder.arena, dep_uri) catch dep_uri;
-                import_path = std.fs.path.basename(cur_path);
+            if (std.mem.eql(u8, dependency_uri, this.builder.handle.uri)) {
+                const current_file_path = Uri.toFsPath(this.builder.arena, dependency_uri) catch dependency_uri;
+                import_path = std.fs.path.basename(current_file_path);
             } else {
                 // prefer relative path from new file's directory if possible; fallback to absolute path
-                const cur_fs_path = Uri.toFsPath(this.builder.arena, this.builder.handle.uri) catch dep_uri;
-                const cur_dir = std.fs.path.dirname(cur_fs_path) orelse ".";
-                const dep_fs_path = Uri.toFsPath(this.builder.arena, dep_uri) catch dep_uri;
-                import_path = std.fs.path.relative(this.builder.arena, cur_dir, dep_fs_path) catch dep_fs_path;
+                const current_fs_path = Uri.toFsPath(this.builder.arena, this.builder.handle.uri) catch dependency_uri;
+                const current_directory = std.fs.path.dirname(current_fs_path) orelse ".";
+                const dependency_file_path = Uri.toFsPath(this.builder.arena, dependency_uri) catch dependency_uri;
+                import_path = std.fs.path.relative(this.builder.arena, current_directory, dependency_file_path) catch dependency_file_path;
             }
             // Dedupe by (import_path, symbol)
-            const key = try std.fmt.allocPrint(this.builder.arena, "{s}\x1f{s}", .{ import_path, ref_name });
-            const seen = try seen_imports.getOrPut(this.builder.arena, key);
-            if (seen.found_existing) continue;
-            seen.key_ptr.* = key;
+            const deduplication_key = try std.fmt.allocPrint(this.builder.arena, "{s}\x1f{s}", .{ import_path, referenced_symbol_name });
+            const already_processed = try processed_imports.getOrPut(this.builder.arena, deduplication_key);
+            if (already_processed.found_existing) continue;
+            already_processed.key_ptr.* = deduplication_key;
 
             // Ensure unique alias name
-            var alias_name = ref_name;
+            var alias_name = referenced_symbol_name;
             var suffix: usize = 1;
-            while (used_aliases.get(alias_name) != null) : (suffix += 1) {
-                alias_name = try std.fmt.allocPrint(this.builder.arena, "{s}{d}", .{ ref_name, suffix });
+            while (used_alias_names.get(alias_name) != null) : (suffix += 1) {
+                alias_name = try std.fmt.allocPrint(this.builder.arena, "{s}{d}", .{ referenced_symbol_name, suffix });
             }
-            const gop = try used_aliases.getOrPut(this.builder.arena, alias_name);
-            if (!gop.found_existing) gop.key_ptr.* = alias_name;
-            try aliases.append(this.builder.arena, .{ .alias = alias_name, .import_path = import_path, .symbol = ref_name });
+            const alias_entry = try used_alias_names.getOrPut(this.builder.arena, alias_name);
+            if (!alias_entry.found_existing) alias_entry.key_ptr.* = alias_name;
+            try import_dependencies.append(this.builder.arena, .{ .alias = alias_name, .import_path = import_path, .symbol = referenced_symbol_name });
         }
 
-        var file_text: std.ArrayList(u8) = .empty;
-        if (needs_std) {
-            try file_text.appendSlice(this.builder.arena, "const std = @import(\"std\");\n");
+        var new_file_content: std.ArrayList(u8) = .empty;
+        if (needs_std_import) {
+            try new_file_content.appendSlice(this.builder.arena, "const std = @import(\"std\");\n");
         }
-        for (aliases.items) |a| {
-            try file_text.appendSlice(this.builder.arena, "const ");
-            try file_text.appendSlice(this.builder.arena, a.alias);
-            try file_text.appendSlice(this.builder.arena, " = @import(\"");
-            try file_text.appendSlice(this.builder.arena, a.import_path);
+        for (import_dependencies.items) |dependency| {
+            try new_file_content.appendSlice(this.builder.arena, "const ");
+            try new_file_content.appendSlice(this.builder.arena, dependency.alias);
+            try new_file_content.appendSlice(this.builder.arena, " = @import(\"");
+            try new_file_content.appendSlice(this.builder.arena, dependency.import_path);
             // Close string and call, then access symbol: ") .symbol;
-            try file_text.appendSlice(this.builder.arena, "\").");
-            try file_text.appendSlice(this.builder.arena, a.symbol);
-            try file_text.appendSlice(this.builder.arena, ";\n");
+            try new_file_content.appendSlice(this.builder.arena, "\").");
+            try new_file_content.appendSlice(this.builder.arena, dependency.symbol);
+            try new_file_content.appendSlice(this.builder.arena, ";\n");
         }
-        if (needs_std or aliases.items.len != 0) try file_text.appendSlice(this.builder.arena, "\n");
-        try file_text.appendSlice(this.builder.arena, vis);
-        try file_text.appendSlice(this.builder.arena, "const ");
-        try file_text.appendSlice(this.builder.arena, name);
-        try file_text.appendSlice(this.builder.arena, " = ");
-        try file_text.appendSlice(this.builder.arena, offsets.nodeToSlice(tree, init));
-        try file_text.appendSlice(this.builder.arena, ";\n");
+        if (needs_std_import or import_dependencies.items.len != 0) try new_file_content.appendSlice(this.builder.arena, "\n");
+        try new_file_content.appendSlice(this.builder.arena, visibility_modifier);
+        try new_file_content.appendSlice(this.builder.arena, "const ");
+        try new_file_content.appendSlice(this.builder.arena, struct_name);
+        try new_file_content.appendSlice(this.builder.arena, " = ");
+        try new_file_content.appendSlice(this.builder.arena, offsets.nodeToSlice(tree, struct_initializer));
+        try new_file_content.appendSlice(this.builder.arena, ";\n");
 
         // Replace original with import alias
-        var replace_loc = offsets.nodeToLoc(tree, decl_node);
-        const end_tok = ast.lastToken(tree, decl_node);
-        if (end_tok + 1 < tree.tokens.len and tree.tokenTag(end_tok + 1) == .semicolon) {
-            const semi_loc = offsets.tokensToLoc(tree, end_tok + 1, end_tok + 1);
-            if (semi_loc.end > replace_loc.end) replace_loc.end = semi_loc.end;
+        var replacement_location = offsets.nodeToLoc(tree, struct_declaration_node);
+        const last_token = ast.lastToken(tree, struct_declaration_node);
+        if (last_token + 1 < tree.tokens.len and tree.tokenTag(last_token + 1) == .semicolon) {
+            const semicolon_location = offsets.tokensToLoc(tree, last_token + 1, last_token + 1);
+            if (semicolon_location.end > replacement_location.end) replacement_location.end = semicolon_location.end;
         }
-        var import_text: std.ArrayList(u8) = .empty;
-        try import_text.appendSlice(this.builder.arena, vis);
-        try import_text.appendSlice(this.builder.arena, "const ");
-        try import_text.appendSlice(this.builder.arena, name);
-        try import_text.appendSlice(this.builder.arena, " = @import(\"");
-        const filename = try std.fmt.allocPrint(this.builder.arena, "{s}.zig", .{name});
-        try import_text.appendSlice(this.builder.arena, filename);
-        try import_text.appendSlice(this.builder.arena, "\").");
-        try import_text.appendSlice(this.builder.arena, name);
-        try import_text.appendSlice(this.builder.arena, ";\n");
+        var import_statement: std.ArrayList(u8) = .empty;
+        try import_statement.appendSlice(this.builder.arena, visibility_modifier);
+        try import_statement.appendSlice(this.builder.arena, "const ");
+        try import_statement.appendSlice(this.builder.arena, struct_name);
+        try import_statement.appendSlice(this.builder.arena, " = @import(\"");
+        const new_filename = try std.fmt.allocPrint(this.builder.arena, "{s}.zig", .{struct_name});
+        try import_statement.appendSlice(this.builder.arena, new_filename);
+        try import_statement.appendSlice(this.builder.arena, "\").");
+        try import_statement.appendSlice(this.builder.arena, struct_name);
+        try import_statement.appendSlice(this.builder.arena, ";\n");
 
         // Build proper URIs and documentChanges (CreateFile + TextDocumentEdits)
-        const cur_fs_path = Uri.toFsPath(this.builder.arena, this.builder.handle.uri) catch return;
-        const cur_dir = std.fs.path.dirname(cur_fs_path) orelse ".";
-        const new_fs_path = try std.fs.path.join(this.builder.arena, &.{ cur_dir, filename });
-        const new_uri = Uri.fromPath(this.builder.arena, new_fs_path) catch return;
+        const current_file_system_path = Uri.toFsPath(this.builder.arena, this.builder.handle.uri) catch return;
+        const current_directory = std.fs.path.dirname(current_file_system_path) orelse ".";
+        const new_file_path = try std.fs.path.join(this.builder.arena, &.{ current_directory, new_filename });
+        const new_file_uri = Uri.fromPath(this.builder.arena, new_file_path) catch return;
 
-        var eb = EditBuilder.init(this.builder.arena);
-        try eb.createFile(new_uri);
-        try eb.insertAtPosition(new_uri, .{ .line = 0, .character = 0 }, file_text.items);
-        const replace_range = offsets.locToRange(tree.source, replace_loc, this.builder.offset_encoding);
-        try eb.replaceRange(this.builder.handle.uri, replace_range, import_text.items);
+        var edit_builder = EditBuilder.init(this.builder.arena);
+        try edit_builder.createFile(new_file_uri);
+        try edit_builder.insertAtPosition(new_file_uri, .{ .line = 0, .character = 0 }, new_file_content.items);
+        const replacement_range = offsets.locToRange(tree.source, replacement_location, this.builder.offset_encoding);
+        try edit_builder.replaceRange(this.builder.handle.uri, replacement_range, import_statement.items);
 
         try this.builder.actions.append(this.builder.arena, .{
             .title = try std.fmt.allocPrint(this.builder.arena, "move to new file", .{}),
             .kind = .refactor,
             .isPreferred = false,
-            .edit = try eb.build(),
+            .edit = try edit_builder.build(),
         });
     }
 };
